@@ -1,10 +1,1 @@
-{
-  "name":"zhajinhua-v28-online-web",
-  "version":"1.0.0",
-  "private":true,
-  "description":"V28-inspired multiplayer ZhaJinHua web prototype",
-  "main":"server.js",
-  "scripts":{"start":"node server.js"},
-  "engines":{"node":">=18"},
-  "dependencies":{"express":"^4.21.2","socket.io":"^4.8.1"}
-}
+{"name":"zhajinhua-v28-public-lobby","version":"1.0.0","private":true,"description":"V28 original table UI with public room lobby and quick matchmaking","main":"server.js","scripts":{"start":"node server.js"},"dependencies":{"express":"^4.21.2","socket.io":"^4.8.1"},"engines":{"node":">=18"}}
