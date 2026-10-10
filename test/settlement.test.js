@@ -3,6 +3,8 @@ const assert = require('node:assert/strict');
 const { settlePotLayers } = require('../lib/settlement');
 const { rank, compareRanks, is235, compareHands } = require('../lib/hand-rank');
 const { compareTopUp } = require('../lib/compare-fee');
+const { botBetOptions } = require('../lib/bot-bets');
+const { getBetOptions, validateBetAction } = require('../lib/betting-rules');
 
 const cmp = (a, b) => (a.power || 0) - (b.power || 0);
 const player = (id, totalBet, power, out = false, chips = 1000) => ({ id, name: id, totalBet, power, out, leftRoom: false, chips, cards: [] });
@@ -32,6 +34,37 @@ const sum = map => [...map.values()].reduce((n, x) => n + x, 0);
   assert.equal(compareTopUp(100, 120), 0);
   assert.equal(compareTopUp(100, 0), 100);
   assert.equal(compareTopUp(20, 50), 0);
+}
+
+
+// Bots must not be falsely marked all-in when the current call exceeds 60.
+{
+  assert.deepEqual(botBetOptions(20, 1000), [20, 40, 60]);
+  assert.deepEqual(botBetOptions(80, 1000), [80, 100, 120]);
+  assert.deepEqual(botBetOptions(100, 100), [100]);
+  assert.deepEqual(botBetOptions(100, 99), []);
+}
+
+
+// V33 fixed bet buttons and cumulative contribution targets.
+{
+  assert.deepEqual(getBetOptions({ hasBetAction: false, requiredBet: 20, chips: 1000 }), [
+    { mode: 'open', amount: 20 }, { mode: 'open', amount: 40 }, { mode: 'open', amount: 60 }
+  ]);
+  assert.deepEqual(getBetOptions({ hasBetAction: true, requiredBet: 100, chips: 1000, roundBet: 40 }), [
+    { mode: 'call', amount: 100 }, { mode: 'raise', amount: 120 }, { mode: 'raise', amount: 140 }, { mode: 'raise', amount: 160 }
+  ]);
+  assert.equal(validateBetAction({ hasBetAction: false, requiredBet: 20, chips: 1000, mode: 'open', amount: 40 }).payAmount, 40);
+  assert.equal(validateBetAction({ hasBetAction: true, requiredBet: 100, chips: 1000, roundBet: 40, mode: 'call', amount: 100 }).payAmount, 60);
+  assert.equal(validateBetAction({ hasBetAction: true, requiredBet: 100, chips: 1000, roundBet: 80, mode: 'raise', amount: 120 }).payAmount, 40);
+  assert.equal(validateBetAction({ hasBetAction: false, requiredBet: 20, chips: 1000, mode: 'raise', amount: 40 }).ok, false);
+  const shortOpen = validateBetAction({ hasBetAction: false, requiredBet: 20, chips: 10, roundBet: 0, mode: 'open', amount: 60 });
+  assert.equal(shortOpen.ok, true); assert.equal(shortOpen.mode, 'allin-open'); assert.equal(shortOpen.payAmount, 10);
+  assert.equal(validateBetAction({ hasBetAction: false, requiredBet: 20, chips: 10, mode: 'open', amount: 999 }).ok, false);
+  assert.equal(validateBetAction({ hasBetAction: true, requiredBet: 100, chips: 1000, roundBet: 0, mode: 'raise', amount: 999 }).ok, false);
+  const shortCall = validateBetAction({ hasBetAction: true, requiredBet: 100, chips: 30, roundBet: 20, mode: 'call', amount: 100 });
+  assert.equal(shortCall.ok, true); assert.equal(shortCall.mode, 'allin-call'); assert.equal(shortCall.payAmount, 30);
+  assert.equal(validateBetAction({ hasBetAction: true, requiredBet: 100, chips: 30, roundBet: 20, mode: 'call', amount: 999 }).ok, false);
 }
 
 // Uncalled excess is refunded; contested lower layer goes to the best eligible hand.
@@ -101,4 +134,4 @@ for (let seed = 1; seed <= 250; seed++) {
   assert.equal(sum(r.payouts), r.totalPot, `seed ${seed}`);
 }
 
-console.log('Settlement tests passed (250 randomized conservation cases + 8 targeted rule groups).');
+console.log('Settlement tests passed (250 randomized conservation cases + targeted regression groups).');
