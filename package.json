@@ -1,0 +1,10 @@
+{
+  "name": "zhajinhua-v29-online",
+  "version": "1.0.0",
+  "private": true,
+  "description": "V28-style interface with online multiplayer rooms and virtual chips",
+  "main": "server.js",
+  "scripts": {"start": "node server.js"},
+  "dependencies": {"express": "^4.21.2", "socket.io": "^4.8.1"},
+  "engines": {"node": ">=18"}
+}
