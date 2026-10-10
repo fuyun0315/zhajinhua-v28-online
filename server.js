@@ -5,6 +5,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const { Server } = require('socket.io');
+const { settlePotLayers } = require('./lib/settlement');
 
 const PORT = Number(process.env.PORT || 3000);
 const MAX_PLAYERS = 6;
@@ -145,6 +146,8 @@ function touchRoom(room) {
   room.lastActivityAt = Date.now();
   room.inactivityTimer = setTimeout(() => {
     if (!rooms.has(room.code)) return;
+    // Never destroy a live hand merely because no human event reached this timer.
+    if (room.started && !room.ended) { touchRoom(room); return; }
     clearTurnTimers(room);
     for (const p of room.players) {
       if (!p.socketId) continue;
@@ -282,13 +285,45 @@ function botAct(room, p) {
   addLog(room, p.name + '投注' + amount + '，剩余筹码' + p.chips + '，当前奖池' + room.pot + (p.allIn ? '，已全部投注' : '') + '；下一位最低下注' + amount);
   setEvent(room, p.allIn ? 'allin' : 'bet', p.name + '下注' + amount, { playerId:p.id, amount }); emitRoom(room); chooseNext(room);
 }
-function startRound(room) {
-  if (room.started || room.players.length < 2 || !room.players.every(p => p.ready)) return;
-  if (room.players.some(p => p.chips < ANTE)) {
-    const poor = room.players.filter(p => p.chips < ANTE).map(p => p.name).join('、');
-    room.players.forEach(p => p.ready = false);
-    addLog(room, '筹码不足20无法缴纳底注：' + poor + '。请充值后再准备。'); setEvent(room, 'warning', '有玩家筹码不足20，无法开始本局'); emitRoom(room); return;
+function pruneUnderfundedPlayers(room) {
+  if (!room || (room.started && !room.ended)) return [];
+  const poor = room.players.filter(p => !p.leftRoom && p.chips < ANTE);
+  if (!poor.length) return [];
+  const poorNames = poor.map(p => p.name);
+  for (const p of poor) {
+    p.leftRoom = true;
+    p.ready = false;
+    p.connected = false;
+    const socketId = p.socketId;
+    p.socketId = null;
+    if (socketId) {
+      const sock = io.sockets.sockets.get(socketId);
+      if (sock) {
+        sock.emit('roomNotice', `你的筹码不足当前牌桌最低底注${ANTE}，已在新一局开始前退出牌桌。补充虚拟筹码后可重新加入。`);
+        sock.emit('leftRoom');
+        sock.data.room = null;
+        sock.data.player = null;
+      }
+    }
   }
+  room.players = room.players.filter(p => !p.leftRoom);
+  addLog(room, poorNames.join('、') + `筹码不足最低底注${ANTE}，已退出牌桌并释放座位`);
+  setEvent(room, 'warning', '筹码不足最低底注的玩家已退出牌桌');
+  if (room.players.length === 0) {
+    clearTurnTimers(room);
+    if (room.inactivityTimer) clearTimeout(room.inactivityTimer);
+    rooms.delete(room.code);
+    io.emit('lobbyRooms', lobby());
+  } else {
+    emitRoom(room);
+  }
+  return poor;
+}
+
+function startRound(room) {
+  if (room.started) return;
+  pruneUnderfundedPlayers(room);
+  if (!rooms.has(room.code) || room.players.length < 2 || !room.players.every(p => p.ready)) return;
   clearTurnTimers(room);
   room.round += 1; room.deck = shuffledDeck(); room.pot = 0; room.lastCompare = []; room.lastSettlement = null; room.requiredBet = ANTE; room.previousBet = ANTE; room.ended = false; room.started = true; room.dealing = true; room.phase = 'playing'; room.compareMode = false; room.log = [];
   for (const p of room.players) {
@@ -317,57 +352,85 @@ function startRound(room) {
 }
 function finishRound(room) {
   if (room.ended) return;
-  clearTurnTimers(room); room.ended = true; room.started = false; room.dealing = false; room.phase = 'ready'; room.compareMode = false; room.turn = null;
-  const participants = room.players, potBefore = room.pot;
-  const levels = [...new Set(participants.map(p => p.totalBet || 0).filter(v => v > 0))].sort((a,b)=>a-b);
-  let prev = 0; const payouts = new Map(), payoutWinners = [], layers = [];
-  const handEligible = participants.filter(p => !p.out);
-  for (const level of levels) {
-    const contributors = participants.filter(p => (p.totalBet || 0) >= level);
-    const potLayer = (level - prev) * contributors.length;
-    if (potLayer <= 0) { prev = level; continue; }
-    let eligible = contributors.filter(p => !p.out);
-    if (!eligible.length) eligible = handEligible; // dead money must not disappear from the game
-    if (!eligible.length) { prev = level; continue; }
-    let best = eligible[0], tied = [best];
-    for (const p of eligible.slice(1)) {
-      const c = compareRanks(rank(p.cards), rank(best.cards));
-      if (c > 0) { best = p; tied = [p]; } else if (c === 0) tied.push(p);
-    }
-    const each = Math.floor(potLayer / tied.length), rem = potLayer % tied.length;
-    tied.forEach((p, i) => { const pay = each + (i === 0 ? rem : 0); payouts.set(p.id, (payouts.get(p.id)||0)+pay); if (pay > 0 && !payoutWinners.some(w => w.id === p.id)) payoutWinners.push(p); });
-    layers.push({ from:prev, to:level, amount:potLayer, contributors:contributors.map(p=>p.id), eligible:tied.map(p=>p.id) });
-    prev = level;
+  clearTurnTimers(room);
+  room.ended = true; room.started = false; room.dealing = false; room.phase = 'ready'; room.compareMode = false; room.turn = null;
+  const participants = room.players;
+  const contributionTotal = participants.reduce((sum, p) => sum + Math.max(0, Math.floor(Number(p.totalBet) || 0)), 0);
+  const recordedPot = Math.max(0, Math.floor(Number(room.pot) || 0));
+  if (recordedPot !== contributionTotal) {
+    console.error(`[settlement] Room ${room.code}: pot=${recordedPot}, cumulative contributions=${contributionTotal}; using contribution ledger.`);
+    addLog(room, '系统已按玩家累计投入账本校正底池金额');
   }
+  // The cumulative per-player contribution ledger is the source of truth.
+  const potBefore = contributionTotal;
+  room.pot = potBefore;
+  const chipsBeforeSettlement = participants.reduce((sum, p) => sum + (Number(p.chips) || 0), 0) + potBefore;
+  let result;
+  try {
+    result = settlePotLayers(participants, (a, b) => compareRanks(rank(a.cards), rank(b.cards)));
+  } catch (err) {
+    console.error('[settlement] Safe fallback:', err.message);
+    // Last-resort conservation path: return each player's own contributions.
+    const payouts = new Map();
+    for (const p of participants) payouts.set(p.id, Math.max(0, Math.floor(Number(p.totalBet) || 0)));
+    result = { totalPot: potBefore, payouts, refunds: new Map(payouts), layers: [{ type: 'safety-refund', amount: potBefore, winners: [...payouts].map(([playerId, amount]) => ({ playerId, amount })) }] };
+    addLog(room, '本局结算触发安全保护，已按各玩家累计投入退还筹码');
+  }
+  const payouts = result.payouts;
   payouts.forEach((amount, id) => { const p = participants.find(x => x.id === id); if (p) p.chips += amount; });
-  const payoutList = [...payouts.entries()].map(([playerId, amount]) => ({ playerId, amount }));
+  const payoutList = [...payouts.entries()].filter(([, amount]) => amount > 0).map(([playerId, amount]) => ({ playerId, amount }));
+  const refundList = [...result.refunds.entries()].filter(([, amount]) => amount > 0).map(([playerId, amount]) => ({ playerId, amount }));
+
+  const chipsAfterSettlement = participants.reduce((sum, p) => sum + (Number(p.chips) || 0), 0);
+  if (chipsAfterSettlement !== chipsBeforeSettlement) {
+    console.error(`[settlement] CHIP CONSERVATION ERROR room=${room.code} before=${chipsBeforeSettlement} after=${chipsAfterSettlement}`);
+    addLog(room, '筹码总量校验异常，请保留本局记录以便排查');
+  } else {
+    addLog(room, `筹码守恒校验通过：结算前后总筹码均为${chipsAfterSettlement}`);
+  }
+
   for (const p of participants) {
-    p.reveal = true; p.ready = !!p.isBot;
+    p.reveal = true;
+    p.ready = !!p.isBot;
     if (p.accountId && data.accounts[p.accountId]) {
       const a = data.accounts[p.accountId]; a.chips = p.chips; a.games = (a.games || 0) + 1;
-      if ((payouts.get(p.id)||0) > 0) a.wins = (a.wins || 0) + 1;
+      if ((payouts.get(p.id) || 0) > 0 && !(result.refunds.get(p.id) > 0 && payouts.get(p.id) === result.refunds.get(p.id))) a.wins = (a.wins || 0) + 1;
     }
   }
-  data.totalGames = (data.totalGames || 0) + 1; saveData();
-  const resultText = payoutWinners.length ? payoutWinners.map(p => p.name + '获得 ' + payouts.get(p.id) + ' 筹码').join('；') : '本局结束，没有获胜者';
-  const summary = participants.map(p => p.name + '：+' + (payouts.get(p.id)||0) + '筹码').join('　');
-  room.lastSettlement = { pot:potBefore, payouts:payoutList, layers, id:nextEventId };
+  data.totalGames = (data.totalGames || 0) + 1;
+  saveData();
+  const paidWinners = participants.map(p => ({
+    player: p,
+    winnings: Math.max(0, (payouts.get(p.id) || 0) - (result.refunds.get(p.id) || 0))
+  })).filter(x => x.winnings > 0);
+  const winnerText = paidWinners.map(x => x.player.name + '赢得奖池 ' + x.winnings + ' 筹码');
+  const refundText = refundList.map(item => {
+    const p = participants.find(x => x.id === item.playerId);
+    return (p ? p.name : '玩家') + '退还未匹配投入 ' + item.amount + ' 筹码';
+  });
+  const resultText = [...winnerText, ...refundText].join('；') || '本局结束，没有可分配奖池';
+  const summary = participants.map(p => {
+    const won = Math.max(0, (payouts.get(p.id) || 0) - (result.refunds.get(p.id) || 0));
+    const refund = result.refunds.get(p.id) || 0;
+    return p.name + '：赢得' + won + '，退还' + refund;
+  }).join('　');
+  room.lastSettlement = { pot: potBefore, payouts: payoutList, refunds: refundList, layers: result.layers, id: nextEventId };
   room.pot = 0;
-  addLog(room, '第' + room.round + '局结算：' + summary); addLog(room, resultText);
-  setEvent(room, 'winner', resultText, { settlement:room.lastSettlement });
-  for (const p of participants) {
-    if (p.chips < ANTE) {
-      p.leftRoom = true; p.ready = false;
-      if (p.socketId) {
-        const sock = io.sockets.sockets.get(p.socketId);
-        if (sock) { sock.emit('roomNotice', '你的剩余筹码低于最低底注20，已自动退出牌桌。'); sock.emit('leftRoom'); sock.data.room = null; sock.data.player = null; }
-      }
-    }
-  }
+  addLog(room, '第' + room.round + '局结算：' + summary);
+  addLog(room, resultText);
+  setEvent(room, 'winner', resultText, { settlement: room.lastSettlement });
+  // Low stacks stay seated through settlement. They are removed at the next
+  // round's eligibility check, so zero/low chips do not trigger mid-hand exits.
   room.players = room.players.filter(p => !p.leftRoom);
-  if (room.players.length === 0) { if (room.inactivityTimer) clearTimeout(room.inactivityTimer); rooms.delete(room.code); }
-  emitRoom(room);
+  if (room.players.length === 0) {
+    if (room.inactivityTimer) clearTimeout(room.inactivityTimer);
+    rooms.delete(room.code);
+    io.emit('lobbyRooms', lobby());
+  } else {
+    emitRoom(room);
+  }
 }
+
 function requireUser(socket) {
   const username = socket.data.username;
   if (!username || !data.accounts[username]) { socket.emit('errorMessage', '登录状态已失效，请重新登录。'); return null; }
@@ -409,7 +472,9 @@ io.on('connection', socket => {
     const u = requireUser(socket); if (!u) return;
     const existing = findPlayerRoom(u);
     if (existing) { const {room, player} = existing; player.socketId = socket.id; player.connected = true; socket.data.room = room.code; socket.data.player = player.id; socket.emit('roomCreated', { code: room.code, resumed: true }); emitRoom(room); return; }
-    const a = data.accounts[u]; const p = freshPlayer({ accountId: u, name: a.name, chips: a.chips }); p.socketId = socket.id; p.connected = true;
+    const a = data.accounts[u];
+    if ((Number(a.chips) || 0) < ANTE) { socket.emit('errorMessage', `你的虚拟筹码不足当前最低底注${ANTE}，暂时不能创建或加入牌桌。`); return; }
+    const p = freshPlayer({ accountId: u, name: a.name, chips: a.chips }); p.socketId = socket.id; p.connected = true;
     const c = code(); const room = { code:c, players:[p], phase:'ready', round:0, turn:null, pot:0, requiredBet:ANTE, previousBet:ANTE, started:false, dealing:false, ended:false, compareMode:false, log:[], message:'房间已创建，等待其他玩家加入。所有玩家准备后自动开始。', event:{id:nextEventId++,type:'lobby',text:'房间已创建'}, timer:null, tick:null, deck:[], lastCompare:[], lastSettlement:null, inactivityTimer:null };
     rooms.set(c, room); touchRoom(room); socket.data.room = c; socket.data.player = p.id; socket.emit('roomCreated', { code:c }); emitRoom(room);
   });
@@ -419,6 +484,8 @@ io.on('connection', socket => {
     if (existing) { const {room, player} = existing; player.socketId = socket.id; player.connected = true; socket.data.room = room.code; socket.data.player = player.id; socket.emit('roomJoined', {code:room.code,resumed:true}); emitRoom(room); return; }
     const room = rooms.get(String(roomCode||'').trim());
     if (!room) { socket.emit('errorMessage', '房间不存在，请检查6位房间号。'); return; }
+    const account = data.accounts[u];
+    if ((Number(account.chips) || 0) < ANTE) { socket.emit('errorMessage', `你的虚拟筹码不足当前最低底注${ANTE}，无法加入该房间。`); return; }
     if (room.started && !room.ended) { socket.emit('errorMessage', '该房间正在进行牌局，请选择等待中的房间。'); return; }
     if (room.players.length >= MAX_PLAYERS) { socket.emit('errorMessage', '房间已满，每桌最多6名玩家。'); return; }
     const a = data.accounts[u]; const p = freshPlayer({ accountId:u, name:a.name, chips:a.chips }); p.socketId = socket.id; p.connected = true;
@@ -433,15 +500,25 @@ io.on('connection', socket => {
     room.players.push(freshPlayer({ name, isBot:true, chips:1000 })); touchRoom(room); addLog(room,name+'加入房间（机器人已准备）'); setEvent(room,'join',name+'加入房间'); socket.emit('botAdded',{code:room.code}); emitRoom(room);
   });
   socket.on('toggleReady', ({ready}={}) => {
-    const u = requireUser(socket); if (!u) return; const room = roomOf(socket); const p = roomPlayer(room,socket); if (!room||!p) return;
+    const u = requireUser(socket); if (!u) return;
+    const room = roomOf(socket); if (!room) return;
     if (room.started && !room.ended) return socket.emit('errorMessage','本局正在进行中，不能修改准备状态。');
-    if (room.players.length < 2) return socket.emit('errorMessage','至少需要2名玩家才能开始。');
-    touchRoom(room); p.ready = typeof ready === 'boolean' ? ready : !p.ready;
+    touchRoom(room);
+    pruneUnderfundedPlayers(room);
+    if (!rooms.has(room.code)) { socket.data.room = null; socket.data.player = null; return; }
+    const p = roomPlayer(room, socket);
+    if (!p) {
+      // The player who clicked may itself have been removed for insufficient chips.
+      // If everyone left at the table is already ready, do not leave them waiting.
+      if (room.players.length >= 2 && room.players.every(x => x.ready)) startRound(room);
+      else emitRoom(room);
+      return;
+    }
+    if (room.players.length < 2) { emitRoom(room); return socket.emit('errorMessage','至少需要2名筹码达标的玩家才能开始。'); }
+    p.ready = typeof ready === 'boolean' ? ready : !p.ready;
     addLog(room,p.name+(p.ready?'已准备':'取消准备')); setEvent(room,'ready',p.name+(p.ready?'已准备':'取消准备'));
-    if (room.players.every(x=>x.ready)) {
-      if (room.players.length < 2) { emitRoom(room); return; }
-      startRound(room);
-    } else emitRoom(room);
+    if (room.players.every(x=>x.ready)) startRound(room);
+    else emitRoom(room);
   });
   socket.on('action', ({action,data:payload={}}={}) => {
     const u = requireUser(socket); if (!u) return; const room = roomOf(socket); const p = roomPlayer(room,socket); if (!room||!p) return; touchRoom(room);

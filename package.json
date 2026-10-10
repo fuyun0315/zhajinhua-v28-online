@@ -1,16 +1,19 @@
 {
   "name": "zhajinhua-v32-online",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "private": true,
   "description": "Multiplayer Chinese Golden Flower based on uploaded V28 rules, with persistent login, chips and online peak stats",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "check": "node --check server.js && node --check public/client.js"
+    "check": "node --check server.js && node --check public/client.js && node --check lib/settlement.js && node --check test/settlement.test.js",
+    "test": "node test/settlement.test.js"
   },
   "dependencies": {
     "express": "^4.21.2",
     "socket.io": "^4.8.1"
   },
-  "engines": { "node": ">=18" }
+  "engines": {
+    "node": ">=18"
+  }
 }
