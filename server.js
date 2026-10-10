@@ -8,7 +8,7 @@ const { Server } = require('socket.io');
 const { settlePotLayers } = require('./lib/settlement');
 const { rank, compareHands } = require('./lib/hand-rank');
 const { compareTopUp } = require('./lib/compare-fee');
-const { getBetOptions, validateBetAction } = require('./lib/betting-rules');
+const { getActionBase, getBetOptions, validateBetAction } = require('./lib/betting-rules');
 
 const PORT = Number(process.env.PORT || 3000);
 const MAX_PLAYERS = 6;
@@ -83,7 +83,7 @@ function profile(username) {
 const app = express();
 app.set('trust proxy', 1);
 app.use(express.json({ limit: '32kb' }));
-app.get('/health', (_req, res) => res.json({ ok: true, version: 'V33', rooms: rooms.size, online: onlineCount(), peakOnline: data.peakOnline, totalGames: data.totalGames, uptime: Math.floor(process.uptime()) }));
+app.get('/health', (_req, res) => res.json({ ok: true, version: 'V37', rooms: rooms.size, online: onlineCount(), peakOnline: data.peakOnline, totalGames: data.totalGames, uptime: Math.floor(process.uptime()) }));
 app.get('/api/stats', (_req, res) => res.json(stats()));
 app.get('/api/me', (req, res) => {
   const username = userFromToken(parseCookies(req.headers.cookie)[SESSION_COOKIE]);
@@ -238,15 +238,15 @@ function trusteeAct(room, p) {
   if (!room.started || room.ended || room.turn !== p.id || p.out || p.allIn) return;
   clearTurnTimers(room);
   const target = Math.max(20, Number(room.requiredBet) || ANTE);
-  const due = Math.max(0, target - (p.roundBet || 0));
+  const due = getActionBase(target, !!p.seen);
   if (p.chips < due) {
     const amount = payIn(room, p, p.chips, { updateLastBet: false });
     room.hasBetAction = true;
     addLog(room, p.name + '筹码不足，托管时已全部投注'); setEvent(room, 'allin', p.name + '筹码不足，已全部投注', { playerId:p.id, amount }); emitRoom(room); checkEnd(room); return;
   }
   const amount = payIn(room, p, due, { updateLastBet: false });
-  room.hasBetAction = true; room.previousBet = target; room.requiredBet = target; room.lastBetAmount = target;
-  addLog(room, p.name + '投注' + amount + '（托管跟注），剩余筹码' + p.chips + '，当前奖池' + room.pot);
+  room.hasBetAction = true; room.previousBet = amount; room.requiredBet = amount; room.lastBetAmount = amount;
+  addLog(room, p.name + (p.seen ? '明牌托管跟注' : '暗牌托管跟注') + amount + '，剩余筹码' + p.chips + '，当前奖池' + room.pot);
   setEvent(room, 'bet', '自动跟注' + amount, { playerId:p.id, amount }); emitRoom(room); chooseNext(room);
 }
 function aiStrength(p) {
@@ -260,15 +260,14 @@ function botAct(room, p) {
   clearTurnTimers(room);
   const strength = aiStrength(p), roll = Math.random();
   const target = Math.max(20, Number(room.requiredBet) || ANTE);
-  const due = Math.max(0, target - (p.roundBet || 0));
+  const due = getActionBase(target, !!p.seen);
   if (p.chips < due) {
     const amount = payIn(room, p, p.chips, { updateLastBet: false });
     room.hasBetAction = true;
     addLog(room, p.name + '筹码不足，已全部投注，等待比牌结束'); setEvent(room, 'allin', p.name + '筹码不足，已全部投注', { playerId:p.id, amount }); emitRoom(room); checkEnd(room); return;
   }
-  // Legal options carry cumulative hand-contribution targets. Only the
-  // difference from this bot's existing contribution is deducted.
-  const legal = getBetOptions({ hasBetAction: !!room.hasBetAction, requiredBet: target, chips: p.chips, roundBet: p.roundBet || 0 });
+  // Bot options are this action's actual bet amounts, independent of prior contributions.
+  const legal = getBetOptions({ hasBetAction: !!room.hasBetAction, requiredBet: target, chips: p.chips, seen: !!p.seen });
   if (!legal.length) {
     // Defensive fallback: this should only be reachable if state is invalid;
     // never label a sufficiently funded bot as all-in just because of a cap.
@@ -283,10 +282,9 @@ function botAct(room, p) {
   else { action = 'bet'; choice = legal[roll < .45 ? 0 : Math.floor(Math.random()*legal.length)]; }
   if (action === 'fold') { p.out = true; addLog(room, p.name + '弃牌'); setEvent(room, 'fold', p.name + '弃牌'); emitRoom(room); checkEnd(room); return; }
   const targetAmount = choice.amount;
-  const payAmount = Math.max(0, targetAmount - (p.roundBet || 0));
-  const amount = payIn(room, p, payAmount, { updateLastBet: false });
-  room.hasBetAction = true; room.previousBet = targetAmount; room.requiredBet = targetAmount; room.lastBetAmount = targetAmount;
-  addLog(room, p.name + '本次投入' + amount + '，本局累计下注' + (p.roundBet || 0) + '，剩余筹码' + p.chips + '，当前奖池' + room.pot + (p.allIn ? '，已全部投注' : '') + '；当前下注目标' + targetAmount);
+  const amount = payIn(room, p, targetAmount, { updateLastBet: false });
+  room.hasBetAction = true; room.previousBet = amount; room.requiredBet = amount; room.lastBetAmount = amount;
+  addLog(room, p.name + '本次投入' + amount + '，本局累计投入' + (p.roundBet || 0) + '，剩余筹码' + p.chips + '，当前奖池' + room.pot + (p.allIn ? '，已全部投注' : '') + '；当前下注目标' + targetAmount);
   setEvent(room, p.allIn ? 'allin' : 'bet', p.name + '本次投入' + amount, { playerId:p.id, amount, targetAmount }); emitRoom(room); chooseNext(room);
 }
 function pruneUnderfundedPlayers(room) {
@@ -501,7 +499,7 @@ io.on('connection', socket => {
     if (room.players.length >= MAX_PLAYERS) return socket.emit('errorMessage','房间已满，每桌最多6名玩家。');
     const names = ['墨染江南','清风入弦','孤舟听雨','长安故里','云水禅心','牌神阿强'];
     const name = names.find(n => !room.players.some(p => p.name === n)) || ('机器人' + Math.floor(100+Math.random()*900));
-    room.players.push(freshPlayer({ name, isBot:true, chips:1000 })); touchRoom(room); addLog(room,name+'加入房间（机器人已准备）'); setEvent(room,'join',name+'加入房间'); socket.emit('botAdded',{code:room.code}); emitRoom(room);
+    room.players.push(freshPlayer({ name, isBot:true, chips:1000 })); touchRoom(room); addLog(room,name+'加入房间，机器人已准备'); setEvent(room,'join',name+'加入房间'); socket.emit('botAdded',{code:room.code}); emitRoom(room);
   });
   socket.on('toggleReady', ({ready}={}) => {
     const u = requireUser(socket); if (!u) return;
@@ -545,24 +543,28 @@ io.on('connection', socket => {
     if (action === 'bet') {
       const mode = typeof payload.mode === 'string' ? payload.mode : '';
       const input = Number(payload.amount);
-      const validation = validateBetAction({ hasBetAction: !!room.hasBetAction, requiredBet: room.requiredBet, chips: p.chips, roundBet: p.roundBet || 0, mode, amount: input });
+      const requiredBeforeAction = Math.max(20, Number(room.requiredBet) || ANTE);
+      const validation = validateBetAction({ hasBetAction: !!room.hasBetAction, requiredBet: room.requiredBet, chips: p.chips, seen: !!p.seen, mode, amount: input });
       if (!validation.ok) return socket.emit('errorMessage', validation.reason);
       clearTurnTimers(room);
       const actual = payIn(room, p, validation.payAmount, { updateLastBet: false });
       room.hasBetAction = true;
       if (validation.mode === 'allin-open') {
-        // A short-stack opening action may commit fewer chips than the chosen
-        // button target. Keep the table target at least at the existing call
-        // level, but recognize a genuine all-in increase if the stack exceeds it.
-        const actualTarget = Math.max(Number(room.requiredBet) || ANTE, Number(p.roundBet) || 0);
+        const actualTarget = Math.max(Number(room.requiredBet) || ANTE, actual);
         room.previousBet = actualTarget; room.requiredBet = actualTarget; room.lastBetAmount = actualTarget;
       } else if (validation.mode !== 'allin-call') {
-        room.previousBet = validation.amount;
-        room.requiredBet = validation.amount;
-        room.lastBetAmount = validation.amount;
+        room.previousBet = actual;
+        room.requiredBet = actual;
+        room.lastBetAmount = actual;
       }
-      const actionText = validation.mode === 'open' ? '下注' : validation.mode === 'call' ? '跟注' : validation.mode === 'raise' ? '加注' : validation.mode === 'allin-open' ? '筹码不足，全下下注' : '筹码不足，全下跟注';
-      addLog(room,p.name+actionText+'，本次投入'+actual+'，本局累计下注'+(p.roundBet||0)+'，剩余筹码'+p.chips+'，当前奖池'+room.pot+(p.allIn?'，已全部投注':'')+'；当前下注目标'+room.requiredBet);
+      const callDue = getActionBase(requiredBeforeAction, !!p.seen);
+      let actionText;
+      if (validation.mode === 'open') actionText = '下注' + validation.amount;
+      else if (validation.mode === 'call') actionText = (p.seen ? '明牌跟注' : '暗牌跟注') + Math.min(callDue, actual);
+      else if (validation.mode === 'raise') actionText = (p.seen ? '明牌加注' : '暗牌加注') + Math.max(0, validation.amount - callDue);
+      else if (validation.mode === 'allin-open') actionText = '全下下注' + actual;
+      else actionText = '全下跟注' + actual;
+      addLog(room,p.name+actionText+'，本次投入'+actual+'，本局累计投入'+(p.roundBet||0)+'，剩余筹码'+p.chips+'，当前奖池'+room.pot+(p.allIn?'，已全部投注':'')+'；当前下注目标'+room.requiredBet);
       setEvent(room,p.allIn?'allin':'bet',p.name+actionText+'，本次投入'+actual,{ playerId:p.id, amount:actual, targetAmount:room.requiredBet, mode:validation.mode }); emitRoom(room); chooseNext(room); return;
     }
     if (action === 'compare') {
@@ -606,7 +608,7 @@ io.on('connection', socket => {
 });
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log('ZhaJinHua V33 listening on port ' + PORT);
+  console.log('ZhaJinHua V37 listening on port ' + PORT);
   console.log('Persistent data file: ' + DATA_FILE);
   if (SESSION_SECRET === 'change-this-secret-in-railway-v31') console.warn('WARNING: set SESSION_SECRET in Railway variables for production.');
 });
