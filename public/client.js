@@ -107,6 +107,8 @@ socket.on('roomCreated', d => {
 });
 socket.on('roomJoined', d => { roomCode = d.code; setText('tableCode', roomCode); showScreen('tableScreen'); tableMessage(d.resumed ? '已恢复原来的牌桌。' : '已加入房间 ' + roomCode + '，等待所有玩家准备。'); socket.emit('lobbyRefresh'); });
 socket.on('errorMessage', msg => { if ($('tableScreen').classList.contains('hidden')) lobbyMessage(msg, true); else tableMessage(msg, true); toast(msg); });
+socket.on('roomNotice', msg => toast(msg));
+socket.on('roomExpired', msg => toast(msg));
 socket.on('botAdded', () => { tableMessage('机器人已加入牌桌并自动准备。'); socket.emit('lobbyRefresh'); });
 socket.on('leftRoom', () => { returningToLobby = false; state = null; compareMode = false; showScreen('lobbyScreen'); socket.emit('lobbyRefresh'); });
 $('backLobbyBtn').addEventListener('click', () => {
@@ -130,8 +132,38 @@ function renderChips() {
   const count = Math.min(18, Math.floor((state.pot || 0) / 20));
   for (let i=0;i<count;i++) { const c=document.createElement('div'); c.className='chip c'+(i%4+1); c.style.left=(35+((i*17)%31))+'%'; c.style.top=(18+((i*23)%59))+'%'; c.style.transform='translate(-50%,-50%) rotate('+(((i*29)%51)-25)+'deg)'; box.appendChild(c); }
 }
+function flyChips(fromEl, toEl, count = 4, colorSeed = 0) {
+  if (!fromEl || !toEl) return;
+  const a = fromEl.getBoundingClientRect(), b = toEl.getBoundingClientRect();
+  const sx = a.left + a.width / 2, sy = a.top + a.height / 2;
+  const tx = b.left + b.width / 2, ty = b.top + b.height / 2;
+  const colors = ['#b83b3b','#376db0','#d0a532','#e8e8e8'];
+  const n = Math.max(1, Math.min(12, Math.floor(count)));
+  for (let i=0;i<n;i++) {
+    const chip = document.createElement('div'); chip.className = 'flying-chip'; chip.style.background = colors[(colorSeed+i)%colors.length];
+    chip.style.left = (sx + (Math.random()*24-12)) + 'px'; chip.style.top = (sy + (Math.random()*18-9)) + 'px';
+    chip.style.transform = 'scale(.7) rotate(' + (i*37) + 'deg)'; document.body.appendChild(chip);
+    requestAnimationFrame(() => requestAnimationFrame(() => { chip.style.left = (tx + (Math.random()*10-5)) + 'px'; chip.style.top = (ty + (Math.random()*10-5)) + 'px'; chip.style.transform = 'scale(1) rotate(' + (i*97) + 'deg)'; }));
+    setTimeout(() => { chip.style.opacity = '0'; setTimeout(() => chip.remove(), 180); }, 720);
+  }
+}
+function animateChipEvent(ev, s) {
+  const pile = $('chipPile');
+  if (ev.type === 'bet' || ev.type === 'allin') {
+    const seat = [...document.querySelectorAll('.seat')].find(el => el.dataset.playerIndex === ev.playerId);
+    const amount = Number(ev.amount) || 20;
+    flyChips(seat, pile, Math.min(12, Math.max(2, Math.ceil(amount/80))), 0);
+  } else if (ev.type === 'winner' && ev.settlement) {
+    const entries = ev.settlement.payouts || [];
+    entries.forEach((item, idx) => {
+      const seat = [...document.querySelectorAll('.seat')].find(el => el.dataset.playerIndex === item.playerId);
+      if (seat) flyChips(pile, seat, Math.min(12, Math.max(2, Math.ceil((Number(item.amount)||0)/Math.max(1, Number(ev.settlement.pot)||1)*14))), idx);
+    });
+  }
+}
 function playEvent(ev) {
   if (!ev || !ev.id || ev.id === lastEventId) return; lastEventId = ev.id;
+  animateChipEvent(ev, state);
   switch (ev.type) {
     case 'start': beep(600,110); setTimeout(()=>beep(760,120),130); speak('发牌开始'); break;
     case 'deal-card': beep(380,90); break;
@@ -191,9 +223,13 @@ function render(s) {
   $('addBot').disabled = s.started || players.length >= (s.maxPlayers || 6); $('addBot').classList.toggle('hidden', s.started || players.length >= (s.maxPlayers || 6));
   $('restart').classList.toggle('hidden', s.started || !me.ready); $('restart').disabled = s.started || !me.ready;
   const betShow = myTurn && !compareMode; ['centerBet20','centerBet40','centerBet60','customBetBtn'].forEach(id=>{$(id).classList.toggle('hidden',!betShow);$(id).disabled=!betShow;});
-  $('centerBet20').disabled = !betShow || 20 < s.requiredBet || me.chips < 20;
-  $('centerBet40').disabled = !betShow || 40 < s.requiredBet || me.chips < 40;
-  $('centerBet60').disabled = !betShow || 60 < s.requiredBet || me.chips < 60;
+  const callAmount = Number(s.requiredBet) || 20;
+  $('centerBet20').textContent = me.chips < callAmount ? '全下跟注 ' + me.chips : '跟注 ' + callAmount;
+  $('centerBet40').textContent = '加注 +20'; $('centerBet60').textContent = '加注 +40'; $('customBetBtn').textContent = '自定义加注';
+  $('centerBet20').disabled = !betShow || me.chips <= 0;
+  $('centerBet40').disabled = !betShow || callAmount + 20 > me.chips;
+  $('centerBet60').disabled = !betShow || callAmount + 40 > me.chips;
+  $('customBetBtn').disabled = !betShow || me.chips <= callAmount;
   if (!betShow) $('customBetWrap').classList.add('hidden');
   const logs = $('log'); logs.innerHTML = ''; (s.log || []).forEach(line=>{ const d=document.createElement('div'); d.textContent=line; logs.appendChild(d); });
   renderChips(); playEvent(s.event);
@@ -207,11 +243,11 @@ $('compare').addEventListener('click', () => { compareMode=true; if(state)render
 $('trustee').addEventListener('click', () => emitAction('trustee'));
 $('addBot').addEventListener('click', () => socket.emit('addBot'));
 $('restart').addEventListener('click', () => emitAction('restart'));
-$('centerBet20').addEventListener('click', () => emitAction('bet',{amount:20}));
-$('centerBet40').addEventListener('click', () => emitAction('bet',{amount:40}));
-$('centerBet60').addEventListener('click', () => emitAction('bet',{amount:60}));
+$('centerBet20').addEventListener('click', () => emitAction('bet',{mode:'call',amount:state?.requiredBet||20}));
+$('centerBet40').addEventListener('click', () => emitAction('bet',{mode:'raise',amount:20}));
+$('centerBet60').addEventListener('click', () => emitAction('bet',{mode:'raise',amount:40}));
 $('customBetBtn').addEventListener('click', () => $('customBetWrap').classList.toggle('hidden'));
-$('customBetConfirm').addEventListener('click', () => { const amount=Number($('customBetInput').value); if(!Number.isSafeInteger(amount)||amount<=0) return tableMessage('请输入有效的整数下注金额。',true); emitAction('bet',{amount}); $('customBetWrap').classList.add('hidden'); });
+$('customBetConfirm').addEventListener('click', () => { const amount=Number($('customBetInput').value); if(!Number.isSafeInteger(amount)||amount<=0) return tableMessage('请输入大于0的整数加注金额。',true); emitAction('bet',{mode:'raise',amount}); $('customBetWrap').classList.add('hidden'); });
 $('customBetInput').addEventListener('keydown',e=>{if(e.key==='Enter')$('customBetConfirm').click();});
 
 restoreSession();
