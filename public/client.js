@@ -192,7 +192,6 @@ function render(s) {
   const readyCount = Number(s.readyCount) || players.filter(p=>p.ready).length;
   setText('tableSubtitle', s.started ? `第 ${s.round} 局 · ${current ? '轮到 '+current.name : '等待操作'}` : s.ended ? '本局已结束 · 等待所有玩家准备下一局' : `等待开始 · 已准备 ${readyCount}/${players.length} 人`);
   setText('pot', '底池：' + (Number(s.pot) || 0));
-  setText('myChipBalance', '我的可用筹码：' + (Number(me.chips) || 0));
   if (currentUser) { currentUser.chips = Number(me.chips) || 0; setText('welcomeBalance', '可用筹码：' + currentUser.chips); }
   if (s.started && s.dealing) setText('deal', '正在发牌，请稍候…');
   else if (s.started) setText('deal', s.turn === s.me ? (me.trustee ? '托管中：自动跟注' : '轮到你操作') : (current ? '等待 ' + current.name + ' 操作' : '等待对手操作'));
@@ -234,7 +233,7 @@ function render(s) {
     el.classList.toggle('hidden', !show);
     el.disabled = !show;
   });
-  const previousAction = Math.max(20, Number(s.requiredBet) || 20);
+  const previousAction = Math.max(20, Number(s.darkBetBase) || 20);
   const callTarget = previousAction * (me.seen ? 2 : 1);
   if (firstBet) {
     $('centerBet20').textContent = '下注20'; $('centerBet40').textContent = '下注40'; $('centerBet60').textContent = '下注60';
@@ -243,10 +242,10 @@ function render(s) {
     $('centerBet40').disabled = !betShow || me.chips <= 0;
     $('centerBet60').disabled = !betShow || me.chips <= 0;
   } else {
-    $('centerBet20').textContent = '跟注 ' + callTarget;
-    $('centerBet40').textContent = '加注20（' + (callTarget + 20) + '）';
-    $('centerBet60').textContent = '加注40（' + (callTarget + 40) + '）';
-    $('centerBet80').textContent = '加注60（' + (callTarget + 60) + '）';
+    $('centerBet20').textContent = '跟注';
+    $('centerBet40').textContent = '加注20';
+    $('centerBet60').textContent = '加注40';
+    $('centerBet80').textContent = '加注60';
     $('centerBet20').disabled = !betShow || me.chips <= 0;
     $('centerBet40').disabled = !betShow || me.chips < callTarget + 20;
     $('centerBet60').disabled = !betShow || me.chips < callTarget + 40;
@@ -267,21 +266,21 @@ $('restart').addEventListener('click', () => emitAction('restart'));
 $('centerBet20').addEventListener('click', () => {
   if (!state) return;
   if (!state.hasBetAction) emitAction('bet', { mode: 'open', amount: 20 });
-  else emitAction('bet', { mode: 'call', amount: Math.max(20, Number(state.requiredBet) || 20) * (meSeen() ? 2 : 1) });
+  else emitAction('bet', { mode: 'call', amount: Math.max(20, Number(state.darkBetBase) || 20) * (meSeen() ? 2 : 1) });
 });
 $('centerBet40').addEventListener('click', () => {
   if (!state) return;
   if (!state.hasBetAction) emitAction('bet', { mode: 'open', amount: 40 });
-  else emitAction('bet', { mode: 'raise', amount: Math.max(20, Number(state.requiredBet) || 20) * (meSeen() ? 2 : 1) + 20 });
+  else emitAction('bet', { mode: 'raise', amount: Math.max(20, Number(state.darkBetBase) || 20) * (meSeen() ? 2 : 1) + 20 });
 });
 $('centerBet60').addEventListener('click', () => {
   if (!state) return;
   if (!state.hasBetAction) emitAction('bet', { mode: 'open', amount: 60 });
-  else emitAction('bet', { mode: 'raise', amount: Math.max(20, Number(state.requiredBet) || 20) * (meSeen() ? 2 : 1) + 40 });
+  else emitAction('bet', { mode: 'raise', amount: Math.max(20, Number(state.darkBetBase) || 20) * (meSeen() ? 2 : 1) + 40 });
 });
 $('centerBet80').addEventListener('click', () => {
   if (!state || !state.hasBetAction) return;
-  emitAction('bet', { mode: 'raise', amount: Math.max(20, Number(state.requiredBet) || 20) * (meSeen() ? 2 : 1) + 60 });
+  emitAction('bet', { mode: 'raise', amount: Math.max(20, Number(state.darkBetBase) || 20) * (meSeen() ? 2 : 1) + 60 });
 });
 
 restoreSession();
