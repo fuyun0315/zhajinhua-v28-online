@@ -37,34 +37,73 @@ const sum = map => [...map.values()].reduce((n, x) => n + x, 0);
 }
 
 
-// Bots must not be falsely marked all-in when the current call exceeds 60.
+// V38: action amount is based on the independent dark-bet baseline;
+// seen players double that amount first, then add the selected raise increment.
+// The current player's cumulative contribution never affects the next action.
 {
-  assert.deepEqual(botBetOptions(20, 1000), [20, 40, 60]);
-  assert.deepEqual(botBetOptions(80, 1000), [80, 100, 120]);
+  assert.deepEqual(botBetOptions(20, 1000), [20, 40, 60, 80]);
+  assert.deepEqual(botBetOptions(20, 1000, true), [40, 60, 80, 100]);
+  assert.deepEqual(botBetOptions(40, 1000), [40, 60, 80, 100]);
+  assert.deepEqual(botBetOptions(40, 1000, true), [80, 100, 120, 140]);
   assert.deepEqual(botBetOptions(100, 100), [100]);
-  assert.deepEqual(botBetOptions(100, 99), []);
-}
+  assert.deepEqual(botBetOptions(100, 99), [99]); // short stack can commit its remaining chips
 
-
-// V33 fixed bet buttons and cumulative contribution targets.
-{
   assert.deepEqual(getBetOptions({ hasBetAction: false, requiredBet: 20, chips: 1000 }), [
     { mode: 'open', amount: 20 }, { mode: 'open', amount: 40 }, { mode: 'open', amount: 60 }
   ]);
-  assert.deepEqual(getBetOptions({ hasBetAction: true, requiredBet: 100, chips: 1000, roundBet: 40 }), [
-    { mode: 'call', amount: 100 }, { mode: 'raise', amount: 120 }, { mode: 'raise', amount: 140 }, { mode: 'raise', amount: 160 }
+  assert.deepEqual(getBetOptions({ hasBetAction: true, requiredBet: 40, chips: 1000, roundBet: 80 }), [
+    { mode: 'call', amount: 40 }, { mode: 'raise', amount: 60 }, { mode: 'raise', amount: 80 }, { mode: 'raise', amount: 100 }
   ]);
+  assert.deepEqual(getBetOptions({ hasBetAction: true, requiredBet: 20, chips: 1000, seen: true }), [
+    { mode: 'call', amount: 40 }, { mode: 'raise', amount: 60 }, { mode: 'raise', amount: 80 }, { mode: 'raise', amount: 100 }
+  ]);
+  assert.deepEqual(getBetOptions({ hasBetAction: true, requiredBet: 60, chips: 1000, seen: true }), [
+    { mode: 'call', amount: 120 }, { mode: 'raise', amount: 140 }, { mode: 'raise', amount: 160 }, { mode: 'raise', amount: 180 }
+  ]);
+
   assert.equal(validateBetAction({ hasBetAction: false, requiredBet: 20, chips: 1000, mode: 'open', amount: 40 }).payAmount, 40);
-  assert.equal(validateBetAction({ hasBetAction: true, requiredBet: 100, chips: 1000, roundBet: 40, mode: 'call', amount: 100 }).payAmount, 60);
-  assert.equal(validateBetAction({ hasBetAction: true, requiredBet: 100, chips: 1000, roundBet: 80, mode: 'raise', amount: 120 }).payAmount, 40);
+  // Previous action was 40. Even though this player has contributed 80,
+  // an unseen call costs 40, not 0 and not a cumulative-contribution delta.
+  const callAfterLargeContribution = validateBetAction({ hasBetAction: true, requiredBet: 40, chips: 1000, roundBet: 80, mode: 'call', amount: 40 });
+  assert.equal(callAfterLargeContribution.ok, true);
+  assert.equal(callAfterLargeContribution.payAmount, 40);
+  // Seen call doubles the previous action, while seen raise doubles only the
+  // previous action and then adds the selected increment (not doubled).
+  assert.equal(validateBetAction({ hasBetAction: true, requiredBet: 20, chips: 1000, seen: true, mode: 'call', amount: 40 }).payAmount, 40);
+  assert.equal(validateBetAction({ hasBetAction: true, requiredBet: 20, chips: 1000, seen: true, mode: 'raise', amount: 60 }).payAmount, 60);
+  assert.equal(validateBetAction({ hasBetAction: true, requiredBet: 60, chips: 1000, seen: true, mode: 'raise', amount: 100 }).ok, false);
+  assert.equal(validateBetAction({ hasBetAction: true, requiredBet: 60, chips: 1000, seen: true, mode: 'raise', amount: 160 }).payAmount, 160);
   assert.equal(validateBetAction({ hasBetAction: false, requiredBet: 20, chips: 1000, mode: 'raise', amount: 40 }).ok, false);
-  const shortOpen = validateBetAction({ hasBetAction: false, requiredBet: 20, chips: 10, roundBet: 0, mode: 'open', amount: 60 });
+  assert.equal(validateBetAction({ hasBetAction: true, requiredBet: 40, chips: 1000, mode: 'open', amount: 40 }).ok, false);
+  const shortOpen = validateBetAction({ hasBetAction: false, requiredBet: 20, chips: 10, mode: 'open', amount: 60 });
   assert.equal(shortOpen.ok, true); assert.equal(shortOpen.mode, 'allin-open'); assert.equal(shortOpen.payAmount, 10);
-  assert.equal(validateBetAction({ hasBetAction: false, requiredBet: 20, chips: 10, mode: 'open', amount: 999 }).ok, false);
-  assert.equal(validateBetAction({ hasBetAction: true, requiredBet: 100, chips: 1000, roundBet: 0, mode: 'raise', amount: 999 }).ok, false);
-  const shortCall = validateBetAction({ hasBetAction: true, requiredBet: 100, chips: 30, roundBet: 20, mode: 'call', amount: 100 });
+  const shortCall = validateBetAction({ hasBetAction: true, requiredBet: 100, chips: 30, roundBet: 80, mode: 'call', amount: 100 });
   assert.equal(shortCall.ok, true); assert.equal(shortCall.mode, 'allin-call'); assert.equal(shortCall.payAmount, 30);
-  assert.equal(validateBetAction({ hasBetAction: true, requiredBet: 100, chips: 30, roundBet: 20, mode: 'call', amount: 999 }).ok, false);
+  const shortSeenCall = validateBetAction({ hasBetAction: true, requiredBet: 100, chips: 30, seen: true, mode: 'call', amount: 200 });
+  assert.equal(shortSeenCall.ok, true); assert.equal(shortSeenCall.mode, 'allin-call'); assert.equal(shortSeenCall.payAmount, 30);
+  assert.equal(validateBetAction({ hasBetAction: true, requiredBet: 100, chips: 30, mode: 'call', amount: 999 }).ok, false);
+  assert.equal(validateBetAction({ hasBetAction: true, requiredBet: 40, chips: 1000, mode: 'raise', amount: 999 }).ok, false);
+}
+
+// V38 buttons show clean action labels; actual cost is calculated separately from dark baseline.
+{
+  const fs = require('node:fs');
+  const client = fs.readFileSync(require('node:path').join(__dirname, '../public/client.js'), 'utf8');
+  assert.match(client, /textContent = '跟注'/);
+  assert.match(client, /textContent = '加注20'/);
+  assert.match(client, /textContent = '加注40'/);
+  assert.match(client, /textContent = '加注60'/);
+  assert.match(client, /darkBetBase/);
+  assert.doesNotMatch(client, /加注20（/);
+  assert.doesNotMatch(client, /加注40（/);
+  assert.doesNotMatch(client, /加注60（/);
+  assert.match(client, /meSeen\(\) \? 2 : 1/);
+  assert.doesNotMatch(client, /callTarget\s*\+\s*20\s*-\s*alreadyPaid/);
+  assert.doesNotMatch(client, /callTarget\s*-\s*alreadyPaid/);
+  const server = fs.readFileSync(require('node:path').join(__dirname, '../server.js'), 'utf8');
+  assert.match(server, /const fee = getActionBase\(room\.darkBetBase \|\| ANTE, !!p\.seen\)/);
+  assert.doesNotMatch(server, /compareTopUp\(fee, p\.roundBet/);
+  assert.match(server, /if \(a\.length <= 1\) finishRound\(room\);\s*else chooseNext\(room\)/);
 }
 
 // Uncalled excess is refunded; contested lower layer goes to the best eligible hand.
