@@ -7,7 +7,6 @@ const path = require('path');
 const { Server } = require('socket.io');
 const { settlePotLayers } = require('./lib/settlement');
 const { rank, compareHands } = require('./lib/hand-rank');
-const { compareTopUp } = require('./lib/compare-fee');
 const { getActionBase, getBetOptions, validateBetAction } = require('./lib/betting-rules');
 
 const PORT = Number(process.env.PORT || 3000);
@@ -83,7 +82,7 @@ function profile(username) {
 const app = express();
 app.set('trust proxy', 1);
 app.use(express.json({ limit: '32kb' }));
-app.get('/health', (_req, res) => res.json({ ok: true, version: 'V37', rooms: rooms.size, online: onlineCount(), peakOnline: data.peakOnline, totalGames: data.totalGames, uptime: Math.floor(process.uptime()) }));
+app.get('/health', (_req, res) => res.json({ ok: true, version: 'V38', rooms: rooms.size, online: onlineCount(), peakOnline: data.peakOnline, totalGames: data.totalGames, uptime: Math.floor(process.uptime()) }));
 app.get('/api/stats', (_req, res) => res.json(stats()));
 app.get('/api/me', (req, res) => {
   const username = userFromToken(parseCookies(req.headers.cookie)[SESSION_COOKIE]);
@@ -169,7 +168,7 @@ function publicState(room, forId) {
     const canSee = (p.id === forId && p.seen) || compareMaySee || room.ended;
     return { id: p.id, name: p.name, chips: p.chips, out: p.out, reveal: room.ended || compareMaySee, seen: p.seen, bet: p.bet, totalBet: p.totalBet, roundBet: p.roundBet || 0, allIn: p.allIn, connected: p.connected, trustee: p.trustee, isBot: !!p.isBot, ready: !!p.ready, timeLeft: p.timeLeft, cards: canSee ? p.cards : p.cards.map(() => null) };
   });
-  return { code: room.code, players: ps, me: forId, phase: room.phase, round: room.round, turn: room.turn, pot: room.pot, requiredBet: room.requiredBet, previousBet: room.previousBet, lastBetAmount: room.lastBetAmount || ANTE, hasBetAction: !!room.hasBetAction, started: room.started, dealing: room.dealing, ended: room.ended, compareMode: room.compareMode, readyCount: room.players.filter(p => p.ready).length, minPlayers: 2, maxPlayers: MAX_PLAYERS, log: room.log.slice(0, 45), message: room.message, event: room.event, lastSettlement: room.lastSettlement || null, stats: stats() };
+  return { code: room.code, players: ps, me: forId, phase: room.phase, round: room.round, turn: room.turn, pot: room.pot, requiredBet: room.requiredBet, darkBetBase: room.darkBetBase || ANTE, previousBet: room.previousBet, lastBetAmount: room.lastBetAmount || ANTE, hasBetAction: !!room.hasBetAction, started: room.started, dealing: room.dealing, ended: room.ended, compareMode: room.compareMode, readyCount: room.players.filter(p => p.ready).length, minPlayers: 2, maxPlayers: MAX_PLAYERS, log: room.log.slice(0, 45), message: room.message, event: room.event, lastSettlement: room.lastSettlement || null, stats: stats() };
 }
 function emitRoom(room) {
   for (const p of room.players) if (p.socketId) io.to(p.socketId).emit('state', publicState(room, p.id));
@@ -211,7 +210,10 @@ function chooseNext(room) {
   if (room.ended) return;
   const a = alive(room);
   const actionable = a.filter(p => !p.allIn && p.chips > 0);
-  if (a.length <= 1 || actionable.length <= 1) { finishRound(room); return; }
+  if (a.length <= 1) { finishRound(room); return; }
+  // If betting cannot continue because everyone else is all-in, resolve the showdown.
+  // A normal fold must not end a hand while two or more players remain in play.
+  if (actionable.length === 0 || (actionable.length === 1 && a.some(p => p.allIn))) { finishRound(room); return; }
   const idx = room.players.findIndex(p => p.id === room.turn);
   for (let n=1; n<=room.players.length; n++) {
     const p = room.players[(idx+n)%room.players.length];
@@ -221,7 +223,7 @@ function chooseNext(room) {
 }
 function checkEnd(room) {
   const a = alive(room);
-  if (a.length <= 1 || a.filter(p => !p.allIn && p.chips > 0).length <= 1) finishRound(room);
+  if (a.length <= 1) finishRound(room);
   else chooseNext(room);
 }
 function payIn(room, p, amount, options = {}) {
@@ -237,7 +239,7 @@ function payIn(room, p, amount, options = {}) {
 function trusteeAct(room, p) {
   if (!room.started || room.ended || room.turn !== p.id || p.out || p.allIn) return;
   clearTurnTimers(room);
-  const target = Math.max(20, Number(room.requiredBet) || ANTE);
+  const target = Math.max(20, Number(room.darkBetBase) || ANTE);
   const due = getActionBase(target, !!p.seen);
   if (p.chips < due) {
     const amount = payIn(room, p, p.chips, { updateLastBet: false });
@@ -246,6 +248,7 @@ function trusteeAct(room, p) {
   }
   const amount = payIn(room, p, due, { updateLastBet: false });
   room.hasBetAction = true; room.previousBet = amount; room.requiredBet = amount; room.lastBetAmount = amount;
+  if (!p.seen) room.darkBetBase = amount;
   addLog(room, p.name + (p.seen ? '明牌托管跟注' : '暗牌托管跟注') + amount + '，剩余筹码' + p.chips + '，当前奖池' + room.pot);
   setEvent(room, 'bet', '自动跟注' + amount, { playerId:p.id, amount }); emitRoom(room); chooseNext(room);
 }
@@ -259,9 +262,9 @@ function botAct(room, p) {
   if (!room || room.ended || !room.started || room.turn !== p.id || p.out || p.allIn) return;
   clearTurnTimers(room);
   const strength = aiStrength(p), roll = Math.random();
-  const target = Math.max(20, Number(room.requiredBet) || ANTE);
+  const target = Math.max(20, Number(room.darkBetBase) || ANTE);
   const due = getActionBase(target, !!p.seen);
-  if (p.chips < due) {
+  if (room.hasBetAction && p.chips < due) {
     const amount = payIn(room, p, p.chips, { updateLastBet: false });
     room.hasBetAction = true;
     addLog(room, p.name + '筹码不足，已全部投注，等待比牌结束'); setEvent(room, 'allin', p.name + '筹码不足，已全部投注', { playerId:p.id, amount }); emitRoom(room); checkEnd(room); return;
@@ -284,6 +287,7 @@ function botAct(room, p) {
   const targetAmount = choice.amount;
   const amount = payIn(room, p, targetAmount, { updateLastBet: false });
   room.hasBetAction = true; room.previousBet = amount; room.requiredBet = amount; room.lastBetAmount = amount;
+  if (!p.seen) room.darkBetBase = amount;
   addLog(room, p.name + '本次投入' + amount + '，本局累计投入' + (p.roundBet || 0) + '，剩余筹码' + p.chips + '，当前奖池' + room.pot + (p.allIn ? '，已全部投注' : '') + '；当前下注目标' + targetAmount);
   setEvent(room, p.allIn ? 'allin' : 'bet', p.name + '本次投入' + amount, { playerId:p.id, amount, targetAmount }); emitRoom(room); chooseNext(room);
 }
@@ -327,7 +331,7 @@ function startRound(room) {
   pruneUnderfundedPlayers(room);
   if (!rooms.has(room.code) || room.players.length < 2 || !room.players.every(p => p.ready)) return;
   clearTurnTimers(room);
-  room.round += 1; room.deck = shuffledDeck(); room.pot = 0; room.lastCompare = []; room.lastSettlement = null; room.requiredBet = ANTE; room.previousBet = ANTE; room.lastBetAmount = ANTE; room.hasBetAction = false; room.ended = false; room.started = true; room.dealing = true; room.phase = 'playing'; room.compareMode = false; room.log = [];
+  room.round += 1; room.deck = shuffledDeck(); room.pot = 0; room.lastCompare = []; room.lastSettlement = null; room.requiredBet = ANTE; room.darkBetBase = ANTE; room.previousBet = ANTE; room.lastBetAmount = ANTE; room.hasBetAction = false; room.ended = false; room.started = true; room.dealing = true; room.phase = 'playing'; room.compareMode = false; room.log = [];
   for (const p of room.players) {
     p.cards = []; p.out = false; p.reveal = false; p.seen = false; p.bet = 0; p.totalBet = 0; p.roundBet = 0; p.allIn = false; p.timeLeft = TURN_SECONDS; p.ready = false;
     p.chips -= ANTE; p.totalBet = ANTE; p.allIn = p.chips === 0; room.pot += ANTE;
@@ -477,7 +481,7 @@ io.on('connection', socket => {
     const a = data.accounts[u];
     if ((Number(a.chips) || 0) < ANTE) { socket.emit('errorMessage', `你的虚拟筹码不足当前最低底注${ANTE}，暂时不能创建或加入牌桌。`); return; }
     const p = freshPlayer({ accountId: u, name: a.name, chips: a.chips }); p.socketId = socket.id; p.connected = true;
-    const c = code(); const room = { code:c, players:[p], phase:'ready', round:0, turn:null, pot:0, requiredBet:ANTE, previousBet:ANTE, lastBetAmount:ANTE, hasBetAction:false, started:false, dealing:false, ended:false, compareMode:false, log:[], message:'房间已创建，等待其他玩家加入。所有玩家准备后自动开始。', event:{id:nextEventId++,type:'lobby',text:'房间已创建'}, timer:null, tick:null, deck:[], lastCompare:[], lastSettlement:null, inactivityTimer:null };
+    const c = code(); const room = { code:c, players:[p], phase:'ready', round:0, turn:null, pot:0, requiredBet:ANTE, darkBetBase:ANTE, previousBet:ANTE, lastBetAmount:ANTE, hasBetAction:false, started:false, dealing:false, ended:false, compareMode:false, log:[], message:'房间已创建，等待其他玩家加入。所有玩家准备后自动开始。', event:{id:nextEventId++,type:'lobby',text:'房间已创建'}, timer:null, tick:null, deck:[], lastCompare:[], lastSettlement:null, inactivityTimer:null };
     rooms.set(c, room); touchRoom(room); socket.data.room = c; socket.data.player = p.id; socket.emit('roomCreated', { code:c }); emitRoom(room);
   });
   socket.on('joinRoom', ({code:roomCode}={}) => {
@@ -543,8 +547,8 @@ io.on('connection', socket => {
     if (action === 'bet') {
       const mode = typeof payload.mode === 'string' ? payload.mode : '';
       const input = Number(payload.amount);
-      const requiredBeforeAction = Math.max(20, Number(room.requiredBet) || ANTE);
-      const validation = validateBetAction({ hasBetAction: !!room.hasBetAction, requiredBet: room.requiredBet, chips: p.chips, seen: !!p.seen, mode, amount: input });
+      const requiredBeforeAction = Math.max(20, Number(room.darkBetBase) || ANTE);
+      const validation = validateBetAction({ hasBetAction: !!room.hasBetAction, requiredBet: room.darkBetBase || ANTE, chips: p.chips, seen: !!p.seen, mode, amount: input });
       if (!validation.ok) return socket.emit('errorMessage', validation.reason);
       clearTurnTimers(room);
       const actual = payIn(room, p, validation.payAmount, { updateLastBet: false });
@@ -557,6 +561,7 @@ io.on('connection', socket => {
         room.requiredBet = actual;
         room.lastBetAmount = actual;
       }
+      if (!p.seen && actual > 0 && ['open', 'call', 'raise'].includes(validation.mode)) room.darkBetBase = actual;
       const callDue = getActionBase(requiredBeforeAction, !!p.seen);
       let actionText;
       if (validation.mode === 'open') actionText = '下注' + validation.amount;
@@ -570,17 +575,16 @@ io.on('connection', socket => {
     if (action === 'compare') {
       const target = room.players.find(x=>x.id===payload.targetId);
       if (!target || target.id===p.id || target.out || target.leftRoom) return socket.emit('errorMessage','请选择一名仍在场的对手进行比牌。');
-      const fee = Math.max(0, Math.floor(Number(room.lastBetAmount) || ANTE));
-      const topUp = compareTopUp(fee, p.roundBet || 0);
-      if (p.chips < topUp) return socket.emit('errorMessage','比牌费用为 '+fee+' 筹码；你本局已支付 '+(p.roundBet || 0)+'，还需补足 '+topUp+'，当前筹码不足，不能比牌。');
-      if (topUp > 0) payIn(room, p, topUp, { updateLastBet: false });
+      const fee = getActionBase(room.darkBetBase || ANTE, !!p.seen);
+      if (p.chips < fee) return socket.emit('errorMessage','本次比牌需要支付 '+fee+' 筹码（按当前明牌/暗牌跟注规则计算），当前筹码不足，不能比牌。');
+      payIn(room, p, fee, { updateLastBet: false });
       clearTurnTimers(room); room.lastCompare = [p.id, target.id]; p.reveal = true; target.reveal = true;
       const c = compareHands(p.cards, target.cards);
       // 与原版一致：平手时被选择的对手出局。
       if (c < 0) p.out = true; else target.out = true;
       const text = c > 0 ? '你比牌获胜' : c < 0 ? target.name+'比牌获胜' : '比牌平手，你留在场上';
-      addLog(room, p.name+'发起比牌，规定费用'+fee+'，补缴'+topUp+'；'+(c > 0 ? p.name+'比牌获胜' : c < 0 ? target.name+'比牌获胜' : '比牌平手，'+target.name+'出局'));
-      setEvent(room,'compare',text,{ fee, topUp, playerId:p.id, targetId:target.id }); emitRoom(room); checkEnd(room); return;
+      addLog(room, p.name+'发起比牌，本次支付'+fee+'；'+(c > 0 ? p.name+'比牌获胜' : c < 0 ? target.name+'比牌获胜' : '比牌平手，'+target.name+'出局'));
+      setEvent(room,'compare',text,{ fee, playerId:p.id, targetId:target.id }); emitRoom(room); checkEnd(room); return;
     }
   });
   socket.on('leaveRoom', () => {
@@ -608,7 +612,7 @@ io.on('connection', socket => {
 });
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log('ZhaJinHua V37 listening on port ' + PORT);
+  console.log('ZhaJinHua V38 listening on port ' + PORT);
   console.log('Persistent data file: ' + DATA_FILE);
   if (SESSION_SECRET === 'change-this-secret-in-railway-v31') console.warn('WARNING: set SESSION_SECRET in Railway variables for production.');
 });
