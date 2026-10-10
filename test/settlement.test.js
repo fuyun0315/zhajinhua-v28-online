@@ -1,10 +1,38 @@
 'use strict';
 const assert = require('node:assert/strict');
 const { settlePotLayers } = require('../lib/settlement');
+const { rank, compareRanks, is235, compareHands } = require('../lib/hand-rank');
+const { compareTopUp } = require('../lib/compare-fee');
 
 const cmp = (a, b) => (a.power || 0) - (b.power || 0);
 const player = (id, totalBet, power, out = false, chips = 1000) => ({ id, name: id, totalBet, power, out, leftRoom: false, chips, cards: [] });
 const sum = map => [...map.values()].reduce((n, x) => n + x, 0);
+
+
+// Special 2-3-5 rule: 235 beats any leopard, regardless of suits.
+{
+  const hand235 = [{r:'2',s:'♠'},{r:'3',s:'♥'},{r:'5',s:'♦'}];
+  const leopard = [{r:'A',s:'♠'},{r:'A',s:'♥'},{r:'A',s:'♦'}];
+  const ordinary = [{r:'K',s:'♠'},{r:'Q',s:'♥'},{r:'9',s:'♦'}];
+  assert.equal(is235(hand235), true);
+  assert.equal(compareHands(hand235, leopard), 1);
+  assert.equal(compareHands(leopard, hand235), -1);
+  assert.equal(compareHands(hand235, ordinary), compareRanks(rank(hand235), rank(ordinary)));
+  const r = settlePotLayers([
+    { ...player('235', 100, 0), cards: hand235 },
+    { ...player('AAA', 100, 0), cards: leopard }
+  ], (a, b) => compareHands(a.cards, b.cards));
+  assert.equal(r.payouts.get('235'), 200);
+}
+
+// Compare fee is the last actual bet amount minus contributions already paid this hand.
+{
+  assert.equal(compareTopUp(100, 80), 20);
+  assert.equal(compareTopUp(100, 100), 0);
+  assert.equal(compareTopUp(100, 120), 0);
+  assert.equal(compareTopUp(100, 0), 100);
+  assert.equal(compareTopUp(20, 50), 0);
+}
 
 // Uncalled excess is refunded; contested lower layer goes to the best eligible hand.
 {
@@ -73,4 +101,4 @@ for (let seed = 1; seed <= 250; seed++) {
   assert.equal(sum(r.payouts), r.totalPot, `seed ${seed}`);
 }
 
-console.log('Settlement tests passed (250 randomized conservation cases + 6 targeted cases).');
+console.log('Settlement tests passed (250 randomized conservation cases + 8 targeted rule groups).');
