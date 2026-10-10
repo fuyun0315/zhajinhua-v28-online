@@ -1,0 +1,19 @@
+{
+  "name": "zhajinhua-v33-online",
+  "version": "1.5.0",
+  "private": true,
+  "description": "V33 multiplayer Golden Flower with fixed betting options, server-enforced cumulative contribution targets, bot betting fix, 235-beats-leopard rule, and chip-conserving settlement",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "check": "node --check server.js && node --check public/client.js && node --check lib/settlement.js && node --check lib/hand-rank.js && node --check lib/compare-fee.js && node --check lib/betting-rules.js && node --check lib/bot-bets.js && node --check test/settlement.test.js",
+    "test": "node test/settlement.test.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "socket.io": "^4.8.1"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
