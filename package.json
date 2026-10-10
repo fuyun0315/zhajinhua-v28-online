@@ -1,0 +1,10 @@
+{
+  "name": "zhajinhua-v30-online",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Mobile-first Chinese Golden Flower multiplayer game with V28-inspired table and virtual chips",
+  "main": "server.js",
+  "scripts": { "start": "node server.js", "check": "node --check server.js && node --check public/client.js" },
+  "dependencies": { "express": "^4.21.2", "socket.io": "^4.8.1" },
+  "engines": { "node": ">=18" }
+}
