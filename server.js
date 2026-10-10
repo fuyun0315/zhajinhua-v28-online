@@ -6,6 +6,8 @@ const fs = require('fs');
 const path = require('path');
 const { Server } = require('socket.io');
 const { settlePotLayers } = require('./lib/settlement');
+const { rank, compareHands } = require('./lib/hand-rank');
+const { compareTopUp } = require('./lib/compare-fee');
 
 const PORT = Number(process.env.PORT || 3000);
 const MAX_PLAYERS = 6;
@@ -131,7 +133,7 @@ function shuffledDeck() {
   return d;
 }
 function freshPlayer({ id = crypto.randomUUID(), accountId = null, name, isBot = false, chips = 1000 } = {}) {
-  return { id, accountId, leftRoom: false, name: safeName(name), isBot, chips: Number(chips) || 0, cards: [], out: false, reveal: false, seen: false, bet: 0, totalBet: 0, allIn: false, connected: !!isBot, socketId: null, ready: !!isBot, trustee: false, timeLeft: TURN_SECONDS };
+  return { id, accountId, leftRoom: false, name: safeName(name), isBot, chips: Number(chips) || 0, cards: [], out: false, reveal: false, seen: false, bet: 0, totalBet: 0, roundBet: 0, allIn: false, connected: !!isBot, socketId: null, ready: !!isBot, trustee: false, timeLeft: TURN_SECONDS };
 }
 function roomOf(socket) { const c = socket.data.room; return c && rooms.get(c); }
 function roomPlayer(room, socket) { return room?.players.find(p => p.id === socket.data.player) || null; }
@@ -166,7 +168,7 @@ function publicState(room, forId) {
     const canSee = (p.id === forId && p.seen) || compareMaySee || room.ended;
     return { id: p.id, name: p.name, chips: p.chips, out: p.out, reveal: room.ended || compareMaySee, seen: p.seen, bet: p.bet, totalBet: p.totalBet, allIn: p.allIn, connected: p.connected, trustee: p.trustee, isBot: !!p.isBot, ready: !!p.ready, timeLeft: p.timeLeft, cards: canSee ? p.cards : p.cards.map(() => null) };
   });
-  return { code: room.code, players: ps, me: forId, phase: room.phase, round: room.round, turn: room.turn, pot: room.pot, requiredBet: room.requiredBet, previousBet: room.previousBet, started: room.started, dealing: room.dealing, ended: room.ended, compareMode: room.compareMode, readyCount: room.players.filter(p => p.ready).length, minPlayers: 2, maxPlayers: MAX_PLAYERS, log: room.log.slice(0, 45), message: room.message, event: room.event, lastSettlement: room.lastSettlement || null, stats: stats() };
+  return { code: room.code, players: ps, me: forId, phase: room.phase, round: room.round, turn: room.turn, pot: room.pot, requiredBet: room.requiredBet, previousBet: room.previousBet, lastBetAmount: room.lastBetAmount || ANTE, started: room.started, dealing: room.dealing, ended: room.ended, compareMode: room.compareMode, readyCount: room.players.filter(p => p.ready).length, minPlayers: 2, maxPlayers: MAX_PLAYERS, log: room.log.slice(0, 45), message: room.message, event: room.event, lastSettlement: room.lastSettlement || null, stats: stats() };
 }
 function emitRoom(room) {
   for (const p of room.players) if (p.socketId) io.to(p.socketId).emit('state', publicState(room, p.id));
@@ -179,22 +181,6 @@ function persistRoomChips(room) {
   for (const p of room.players) if (p.accountId && data.accounts[p.accountId]) data.accounts[p.accountId].chips = p.chips;
   saveData();
 }
-function rank(cards) {
-  const vm = {2:2,3:3,4:4,5:5,6:6,7:7,8:8,9:9,10:10,J:11,Q:12,K:13,A:14};
-  const vals = cards.map(c => vm[c.r]).sort((a,b) => b-a);
-  const flush = cards.length === 3 && cards.every(c => c.s === cards[0].s);
-  const counts = {}; vals.forEach(v => counts[v] = (counts[v] || 0) + 1);
-  let sh = 0;
-  if (new Set(vals).size === 3) { if (vals[0]-vals[1] === 1 && vals[1]-vals[2] === 1) sh = vals[0]; else if (vals[0] === 14 && vals[1] === 3 && vals[2] === 2) sh = 3; }
-  if (vals[0] === vals[2]) return [6, vals[0]];
-  if (flush && sh) return [5, sh];
-  if (flush) return [4, vals[0], vals[1], vals[2]];
-  if (sh) return [3, sh];
-  const pair = Object.keys(counts).map(Number).find(v => counts[v] === 2);
-  if (pair !== undefined) return [2, pair, vals.find(v => v !== pair)];
-  return [1, vals[0], vals[1], vals[2]];
-}
-function compareRanks(a, b) { const n = Math.max(a.length, b.length); for (let i=0;i<n;i++) { if ((a[i]||0) > (b[i]||0)) return 1; if ((a[i]||0) < (b[i]||0)) return -1; } return 0; }
 function alive(room) { return room.players.filter(p => !p.out); }
 function clearTurnTimers(room) { if (room.timer) clearTimeout(room.timer); if (room.tick) clearInterval(room.tick); room.timer = room.tick = null; }
 function beginTurnTimer(room) {
@@ -237,9 +223,12 @@ function checkEnd(room) {
   if (a.length <= 1 || a.filter(p => !p.allIn && p.chips > 0).length <= 1) finishRound(room);
   else chooseNext(room);
 }
-function payIn(room, p, amount) {
+function payIn(room, p, amount, options = {}) {
   const n = Math.max(0, Math.min(p.chips, Math.floor(Number(amount) || 0)));
-  p.chips -= n; p.bet = n; p.totalBet = (p.totalBet || 0) + n; room.pot += n;
+  p.chips -= n; p.bet = n; p.totalBet = (p.totalBet || 0) + n;
+  p.roundBet = (p.roundBet || 0) + n;
+  room.pot += n;
+  if (options.updateLastBet !== false && n > 0) room.lastBetAmount = n;
   if (p.chips === 0) p.allIn = true;
   persistRoomChips(room);
   return n;
@@ -325,9 +314,9 @@ function startRound(room) {
   pruneUnderfundedPlayers(room);
   if (!rooms.has(room.code) || room.players.length < 2 || !room.players.every(p => p.ready)) return;
   clearTurnTimers(room);
-  room.round += 1; room.deck = shuffledDeck(); room.pot = 0; room.lastCompare = []; room.lastSettlement = null; room.requiredBet = ANTE; room.previousBet = ANTE; room.ended = false; room.started = true; room.dealing = true; room.phase = 'playing'; room.compareMode = false; room.log = [];
+  room.round += 1; room.deck = shuffledDeck(); room.pot = 0; room.lastCompare = []; room.lastSettlement = null; room.requiredBet = ANTE; room.previousBet = ANTE; room.lastBetAmount = ANTE; room.ended = false; room.started = true; room.dealing = true; room.phase = 'playing'; room.compareMode = false; room.log = [];
   for (const p of room.players) {
-    p.cards = []; p.out = false; p.reveal = false; p.seen = false; p.bet = 0; p.totalBet = 0; p.allIn = false; p.timeLeft = TURN_SECONDS; p.ready = false;
+    p.cards = []; p.out = false; p.reveal = false; p.seen = false; p.bet = 0; p.totalBet = 0; p.roundBet = 0; p.allIn = false; p.timeLeft = TURN_SECONDS; p.ready = false;
     p.chips -= ANTE; p.totalBet = ANTE; p.allIn = p.chips === 0; room.pot += ANTE;
   }
   persistRoomChips(room);
@@ -367,7 +356,7 @@ function finishRound(room) {
   const chipsBeforeSettlement = participants.reduce((sum, p) => sum + (Number(p.chips) || 0), 0) + potBefore;
   let result;
   try {
-    result = settlePotLayers(participants, (a, b) => compareRanks(rank(a.cards), rank(b.cards)));
+    result = settlePotLayers(participants, (a, b) => compareHands(a.cards, b.cards));
   } catch (err) {
     console.error('[settlement] Safe fallback:', err.message);
     // Last-resort conservation path: return each player's own contributions.
@@ -475,7 +464,7 @@ io.on('connection', socket => {
     const a = data.accounts[u];
     if ((Number(a.chips) || 0) < ANTE) { socket.emit('errorMessage', `你的虚拟筹码不足当前最低底注${ANTE}，暂时不能创建或加入牌桌。`); return; }
     const p = freshPlayer({ accountId: u, name: a.name, chips: a.chips }); p.socketId = socket.id; p.connected = true;
-    const c = code(); const room = { code:c, players:[p], phase:'ready', round:0, turn:null, pot:0, requiredBet:ANTE, previousBet:ANTE, started:false, dealing:false, ended:false, compareMode:false, log:[], message:'房间已创建，等待其他玩家加入。所有玩家准备后自动开始。', event:{id:nextEventId++,type:'lobby',text:'房间已创建'}, timer:null, tick:null, deck:[], lastCompare:[], lastSettlement:null, inactivityTimer:null };
+    const c = code(); const room = { code:c, players:[p], phase:'ready', round:0, turn:null, pot:0, requiredBet:ANTE, previousBet:ANTE, lastBetAmount:ANTE, started:false, dealing:false, ended:false, compareMode:false, log:[], message:'房间已创建，等待其他玩家加入。所有玩家准备后自动开始。', event:{id:nextEventId++,type:'lobby',text:'房间已创建'}, timer:null, tick:null, deck:[], lastCompare:[], lastSettlement:null, inactivityTimer:null };
     rooms.set(c, room); touchRoom(room); socket.data.room = c; socket.data.player = p.id; socket.emit('roomCreated', { code:c }); emitRoom(room);
   });
   socket.on('joinRoom', ({code:roomCode}={}) => {
@@ -559,13 +548,18 @@ io.on('connection', socket => {
     }
     if (action === 'compare') {
       const target = room.players.find(x=>x.id===payload.targetId);
-      if (!target || target.id===p.id || target.out) return socket.emit('errorMessage','请选择一名仍在场的对手进行比牌。');
+      if (!target || target.id===p.id || target.out || target.leftRoom) return socket.emit('errorMessage','请选择一名仍在场的对手进行比牌。');
+      const fee = Math.max(0, Math.floor(Number(room.lastBetAmount) || ANTE));
+      const topUp = compareTopUp(fee, p.roundBet || 0);
+      if (p.chips < topUp) return socket.emit('errorMessage','比牌费用为 '+fee+' 筹码；你本局已支付 '+(p.roundBet || 0)+'，还需补足 '+topUp+'，当前筹码不足，不能比牌。');
+      if (topUp > 0) payIn(room, p, topUp, { updateLastBet: false });
       clearTurnTimers(room); room.lastCompare = [p.id, target.id]; p.reveal = true; target.reveal = true;
-      const c = compareRanks(rank(p.cards),rank(target.cards));
-      // 与上传的 V28 文件一致：平手时走 else 分支，被选择的对手出局。
+      const c = compareHands(p.cards, target.cards);
+      // 与原版一致：平手时被选择的对手出局。
       if (c < 0) p.out = true; else target.out = true;
       const text = c > 0 ? '你比牌获胜' : c < 0 ? target.name+'比牌获胜' : '比牌平手，你留在场上';
-      addLog(room, c > 0 ? p.name+'比牌获胜' : c < 0 ? target.name+'比牌获胜' : '比牌平手，'+target.name+'出局'); setEvent(room,'compare',text); emitRoom(room); checkEnd(room); return;
+      addLog(room, p.name+'发起比牌，规定费用'+fee+'，补缴'+topUp+'；'+(c > 0 ? p.name+'比牌获胜' : c < 0 ? target.name+'比牌获胜' : '比牌平手，'+target.name+'出局'));
+      setEvent(room,'compare',text,{ fee, topUp, playerId:p.id, targetId:target.id }); emitRoom(room); checkEnd(room); return;
     }
   });
   socket.on('leaveRoom', () => {
