@@ -9,6 +9,7 @@ const { Server } = require('socket.io');
 const PORT = Number(process.env.PORT || 3000);
 const MAX_PLAYERS = 6;
 const ANTE = 20;
+const ROOM_IDLE_MS = 10 * 60 * 1000;
 const TURN_SECONDS = 20;
 const DATA_FILE = process.env.DATA_FILE || process.env.ACCOUNTS_FILE || path.join(__dirname, 'data', 'game-data.json');
 const SESSION_SECRET = process.env.SESSION_SECRET || 'change-this-secret-in-railway-v31';
@@ -78,7 +79,7 @@ function profile(username) {
 const app = express();
 app.set('trust proxy', 1);
 app.use(express.json({ limit: '32kb' }));
-app.get('/health', (_req, res) => res.json({ ok: true, version: 'V31', rooms: rooms.size, online: onlineCount(), peakOnline: data.peakOnline, totalGames: data.totalGames, uptime: Math.floor(process.uptime()) }));
+app.get('/health', (_req, res) => res.json({ ok: true, version: 'V32', rooms: rooms.size, online: onlineCount(), peakOnline: data.peakOnline, totalGames: data.totalGames, uptime: Math.floor(process.uptime()) }));
 app.get('/api/stats', (_req, res) => res.json(stats()));
 app.get('/api/me', (req, res) => {
   const username = userFromToken(parseCookies(req.headers.cookie)[SESSION_COOKIE]);
@@ -137,14 +138,32 @@ function findPlayerRoom(username) {
   for (const room of rooms.values()) { const p = room.players.find(x => x.accountId === username && !x.leftRoom); if (p) return { room, player: p }; }
   return null;
 }
-function setEvent(room, type, text) { room.event = { id: nextEventId++, type, text: String(text || '') }; room.message = String(text || ''); }
+function setEvent(room, type, text, meta = {}) { room.event = { id: nextEventId++, type, text: String(text || ''), ...meta }; room.message = String(text || ''); }
+function touchRoom(room) {
+  if (!room || !rooms.has(room.code)) return;
+  if (room.inactivityTimer) clearTimeout(room.inactivityTimer);
+  room.lastActivityAt = Date.now();
+  room.inactivityTimer = setTimeout(() => {
+    if (!rooms.has(room.code)) return;
+    clearTurnTimers(room);
+    for (const p of room.players) {
+      if (!p.socketId) continue;
+      const s = io.sockets.sockets.get(p.socketId);
+      if (s) { s.emit('roomExpired', '房间连续10分钟没有活动，已自动删除。'); s.emit('leftRoom'); s.data.room = null; s.data.player = null; }
+    }
+    rooms.delete(room.code); io.emit('lobbyRooms', lobby());
+  }, ROOM_IDLE_MS);
+  if (room.inactivityTimer.unref) room.inactivityTimer.unref();
+}
 function addLog(room, text) { room.log.unshift(String(text)); room.log = room.log.slice(0, 80); room.message = String(text); }
 function publicState(room, forId) {
+  const pair = room.lastCompare || [];
   const ps = room.players.map(p => {
-    const canSee = p.id === forId && p.seen || p.reveal || room.ended;
-    return { id: p.id, name: p.name, chips: p.chips, out: p.out, reveal: p.reveal, seen: p.seen, bet: p.bet, totalBet: p.totalBet, allIn: p.allIn, connected: p.connected, trustee: p.trustee, isBot: !!p.isBot, ready: !!p.ready, timeLeft: p.timeLeft, cards: canSee ? p.cards : p.cards.map(() => null) };
+    const compareMaySee = pair.includes(forId) && pair.includes(p.id);
+    const canSee = (p.id === forId && p.seen) || compareMaySee || room.ended;
+    return { id: p.id, name: p.name, chips: p.chips, out: p.out, reveal: room.ended || compareMaySee, seen: p.seen, bet: p.bet, totalBet: p.totalBet, allIn: p.allIn, connected: p.connected, trustee: p.trustee, isBot: !!p.isBot, ready: !!p.ready, timeLeft: p.timeLeft, cards: canSee ? p.cards : p.cards.map(() => null) };
   });
-  return { code: room.code, players: ps, me: forId, phase: room.phase, round: room.round, turn: room.turn, pot: room.pot, requiredBet: room.requiredBet, previousBet: room.previousBet, started: room.started, dealing: room.dealing, ended: room.ended, compareMode: room.compareMode, readyCount: room.players.filter(p => p.ready).length, minPlayers: 2, maxPlayers: MAX_PLAYERS, log: room.log.slice(0, 45), message: room.message, event: room.event, stats: stats() };
+  return { code: room.code, players: ps, me: forId, phase: room.phase, round: room.round, turn: room.turn, pot: room.pot, requiredBet: room.requiredBet, previousBet: room.previousBet, started: room.started, dealing: room.dealing, ended: room.ended, compareMode: room.compareMode, readyCount: room.players.filter(p => p.ready).length, minPlayers: 2, maxPlayers: MAX_PLAYERS, log: room.log.slice(0, 45), message: room.message, event: room.event, lastSettlement: room.lastSettlement || null, stats: stats() };
 }
 function emitRoom(room) {
   for (const p of room.players) if (p.socketId) io.to(p.socketId).emit('state', publicState(room, p.id));
@@ -227,12 +246,12 @@ function trusteeAct(room, p) {
   clearTurnTimers(room);
   if (p.chips < room.requiredBet) {
     const amount = payIn(room, p, p.chips); room.previousBet = Math.max(room.previousBet, amount); room.requiredBet = Math.max(room.requiredBet, amount);
-    addLog(room, p.name + '筹码不足，托管时已全部投注'); setEvent(room, 'allin', p.name + '筹码不足，已全部投注'); emitRoom(room); checkEnd(room); return;
+    addLog(room, p.name + '筹码不足，托管时已全部投注'); setEvent(room, 'allin', p.name + '筹码不足，已全部投注', { playerId:p.id, amount }); emitRoom(room); checkEnd(room); return;
   }
   const amount = payIn(room, p, room.requiredBet);
   room.previousBet = amount; room.requiredBet = amount;
   addLog(room, p.name + '投注' + amount + '（托管跟注），剩余筹码' + p.chips + '，当前奖池' + room.pot);
-  setEvent(room, 'bet', '自动跟注' + amount); emitRoom(room); chooseNext(room);
+  setEvent(room, 'bet', '自动跟注' + amount, { playerId:p.id, amount }); emitRoom(room); chooseNext(room);
 }
 function aiStrength(p) {
   if (!p.cards || p.cards.length < 3) return 1;
@@ -246,12 +265,12 @@ function botAct(room, p) {
   const strength = aiStrength(p), roll = Math.random();
   if (p.chips < room.requiredBet) {
     const amount = payIn(room, p, p.chips); room.previousBet = Math.max(room.previousBet, amount); room.requiredBet = Math.max(room.requiredBet, amount);
-    addLog(room, p.name + '筹码不足，已全部投注，等待比牌结束'); setEvent(room, 'allin', p.name + '筹码不足，已全部投注'); emitRoom(room); checkEnd(room); return;
+    addLog(room, p.name + '筹码不足，已全部投注，等待比牌结束'); setEvent(room, 'allin', p.name + '筹码不足，已全部投注', { playerId:p.id, amount }); emitRoom(room); checkEnd(room); return;
   }
   const legal = [20,40,60].filter(x => x >= room.requiredBet && x <= p.chips);
   if (!legal.length) {
     const amount = payIn(room, p, p.chips); room.previousBet = Math.max(room.previousBet, amount); room.requiredBet = Math.max(room.requiredBet, amount);
-    addLog(room, p.name + '筹码不足，已全部投注'); setEvent(room, 'allin', p.name + '已全部投注'); emitRoom(room); checkEnd(room); return;
+    addLog(room, p.name + '筹码不足，已全部投注'); setEvent(room, 'allin', p.name + '已全部投注', { playerId:p.id, amount }); emitRoom(room); checkEnd(room); return;
   }
   let action = 'bet', amount = legal[0];
   if (strength < 25) { action = roll < .68 ? 'fold' : 'bet'; amount = legal[0]; }
@@ -261,7 +280,7 @@ function botAct(room, p) {
   if (action === 'fold') { p.out = true; addLog(room, p.name + '弃牌'); setEvent(room, 'fold', p.name + '弃牌'); emitRoom(room); checkEnd(room); return; }
   amount = payIn(room, p, amount); room.previousBet = amount; room.requiredBet = amount;
   addLog(room, p.name + '投注' + amount + '，剩余筹码' + p.chips + '，当前奖池' + room.pot + (p.allIn ? '，已全部投注' : '') + '；下一位最低下注' + amount);
-  setEvent(room, p.allIn ? 'allin' : 'bet', p.name + '下注' + amount); emitRoom(room); chooseNext(room);
+  setEvent(room, p.allIn ? 'allin' : 'bet', p.name + '下注' + amount, { playerId:p.id, amount }); emitRoom(room); chooseNext(room);
 }
 function startRound(room) {
   if (room.started || room.players.length < 2 || !room.players.every(p => p.ready)) return;
@@ -271,7 +290,7 @@ function startRound(room) {
     addLog(room, '筹码不足20无法缴纳底注：' + poor + '。请充值后再准备。'); setEvent(room, 'warning', '有玩家筹码不足20，无法开始本局'); emitRoom(room); return;
   }
   clearTurnTimers(room);
-  room.round += 1; room.deck = shuffledDeck(); room.pot = 0; room.requiredBet = ANTE; room.previousBet = ANTE; room.ended = false; room.started = true; room.dealing = true; room.phase = 'playing'; room.compareMode = false; room.log = [];
+  room.round += 1; room.deck = shuffledDeck(); room.pot = 0; room.lastCompare = []; room.lastSettlement = null; room.requiredBet = ANTE; room.previousBet = ANTE; room.ended = false; room.started = true; room.dealing = true; room.phase = 'playing'; room.compareMode = false; room.log = [];
   for (const p of room.players) {
     p.cards = []; p.out = false; p.reveal = false; p.seen = false; p.bet = 0; p.totalBet = 0; p.allIn = false; p.timeLeft = TURN_SECONDS; p.ready = false;
     p.chips -= ANTE; p.totalBet = ANTE; p.allIn = p.chips === 0; room.pot += ANTE;
@@ -299,14 +318,16 @@ function startRound(room) {
 function finishRound(room) {
   if (room.ended) return;
   clearTurnTimers(room); room.ended = true; room.started = false; room.dealing = false; room.phase = 'ready'; room.compareMode = false; room.turn = null;
-  const participants = room.players;
+  const participants = room.players, potBefore = room.pot;
   const levels = [...new Set(participants.map(p => p.totalBet || 0).filter(v => v > 0))].sort((a,b)=>a-b);
-  let prev = 0; const payouts = new Map(); const payoutWinners = [];
+  let prev = 0; const payouts = new Map(), payoutWinners = [], layers = [];
+  const handEligible = participants.filter(p => !p.out);
   for (const level of levels) {
     const contributors = participants.filter(p => (p.totalBet || 0) >= level);
-    const eligible = contributors.filter(p => !p.out);
     const potLayer = (level - prev) * contributors.length;
     if (potLayer <= 0) { prev = level; continue; }
+    let eligible = contributors.filter(p => !p.out);
+    if (!eligible.length) eligible = handEligible; // dead money must not disappear from the game
     if (!eligible.length) { prev = level; continue; }
     let best = eligible[0], tied = [best];
     for (const p of eligible.slice(1)) {
@@ -315,9 +336,11 @@ function finishRound(room) {
     }
     const each = Math.floor(potLayer / tied.length), rem = potLayer % tied.length;
     tied.forEach((p, i) => { const pay = each + (i === 0 ? rem : 0); payouts.set(p.id, (payouts.get(p.id)||0)+pay); if (pay > 0 && !payoutWinners.some(w => w.id === p.id)) payoutWinners.push(p); });
+    layers.push({ from:prev, to:level, amount:potLayer, contributors:contributors.map(p=>p.id), eligible:tied.map(p=>p.id) });
     prev = level;
   }
   payouts.forEach((amount, id) => { const p = participants.find(x => x.id === id); if (p) p.chips += amount; });
+  const payoutList = [...payouts.entries()].map(([playerId, amount]) => ({ playerId, amount }));
   for (const p of participants) {
     p.reveal = true; p.ready = !!p.isBot;
     if (p.accountId && data.accounts[p.accountId]) {
@@ -328,9 +351,21 @@ function finishRound(room) {
   data.totalGames = (data.totalGames || 0) + 1; saveData();
   const resultText = payoutWinners.length ? payoutWinners.map(p => p.name + '获得 ' + payouts.get(p.id) + ' 筹码').join('；') : '本局结束，没有获胜者';
   const summary = participants.map(p => p.name + '：+' + (payouts.get(p.id)||0) + '筹码').join('　');
-  addLog(room, '第' + room.round + '局结算：' + summary); addLog(room, resultText); setEvent(room, 'winner', resultText);
+  room.lastSettlement = { pot:potBefore, payouts:payoutList, layers, id:nextEventId };
+  room.pot = 0;
+  addLog(room, '第' + room.round + '局结算：' + summary); addLog(room, resultText);
+  setEvent(room, 'winner', resultText, { settlement:room.lastSettlement });
+  for (const p of participants) {
+    if (p.chips < ANTE) {
+      p.leftRoom = true; p.ready = false;
+      if (p.socketId) {
+        const sock = io.sockets.sockets.get(p.socketId);
+        if (sock) { sock.emit('roomNotice', '你的剩余筹码低于最低底注20，已自动退出牌桌。'); sock.emit('leftRoom'); sock.data.room = null; sock.data.player = null; }
+      }
+    }
+  }
   room.players = room.players.filter(p => !p.leftRoom);
-  if (room.players.length === 0) rooms.delete(room.code);
+  if (room.players.length === 0) { if (room.inactivityTimer) clearTimeout(room.inactivityTimer); rooms.delete(room.code); }
   emitRoom(room);
 }
 function requireUser(socket) {
@@ -365,7 +400,7 @@ io.on('connection', socket => {
       const oldSocketId = player.socketId;
       player.socketId = socket.id; player.connected = true; socket.data.room = room.code; socket.data.player = player.id;
       if (oldSocketId && oldSocketId !== socket.id) { const oldSocket = io.sockets.sockets.get(oldSocketId); if (oldSocket) oldSocket.disconnect(true); }
-      addLog(room, player.name + '重新连接，已恢复牌桌'); setEvent(room, 'reconnect', player.name + '已重新连接'); emitRoom(room);
+      touchRoom(room); addLog(room, player.name + '重新连接，已恢复牌桌'); setEvent(room, 'reconnect', player.name + '已重新连接'); emitRoom(room);
     }
   }
   socket.emit('stats', stats()); socket.emit('lobbyRooms', lobby());
@@ -375,8 +410,8 @@ io.on('connection', socket => {
     const existing = findPlayerRoom(u);
     if (existing) { const {room, player} = existing; player.socketId = socket.id; player.connected = true; socket.data.room = room.code; socket.data.player = player.id; socket.emit('roomCreated', { code: room.code, resumed: true }); emitRoom(room); return; }
     const a = data.accounts[u]; const p = freshPlayer({ accountId: u, name: a.name, chips: a.chips }); p.socketId = socket.id; p.connected = true;
-    const c = code(); const room = { code:c, players:[p], phase:'ready', round:0, turn:null, pot:0, requiredBet:ANTE, previousBet:ANTE, started:false, dealing:false, ended:false, compareMode:false, log:[], message:'房间已创建，等待其他玩家加入。所有玩家准备后自动开始。', event:{id:nextEventId++,type:'lobby',text:'房间已创建'}, timer:null, tick:null, deck:[] };
-    rooms.set(c, room); socket.data.room = c; socket.data.player = p.id; socket.emit('roomCreated', { code:c }); emitRoom(room);
+    const c = code(); const room = { code:c, players:[p], phase:'ready', round:0, turn:null, pot:0, requiredBet:ANTE, previousBet:ANTE, started:false, dealing:false, ended:false, compareMode:false, log:[], message:'房间已创建，等待其他玩家加入。所有玩家准备后自动开始。', event:{id:nextEventId++,type:'lobby',text:'房间已创建'}, timer:null, tick:null, deck:[], lastCompare:[], lastSettlement:null, inactivityTimer:null };
+    rooms.set(c, room); touchRoom(room); socket.data.room = c; socket.data.player = p.id; socket.emit('roomCreated', { code:c }); emitRoom(room);
   });
   socket.on('joinRoom', ({code:roomCode}={}) => {
     const u = requireUser(socket); if (!u) return;
@@ -387,7 +422,7 @@ io.on('connection', socket => {
     if (room.started && !room.ended) { socket.emit('errorMessage', '该房间正在进行牌局，请选择等待中的房间。'); return; }
     if (room.players.length >= MAX_PLAYERS) { socket.emit('errorMessage', '房间已满，每桌最多6名玩家。'); return; }
     const a = data.accounts[u]; const p = freshPlayer({ accountId:u, name:a.name, chips:a.chips }); p.socketId = socket.id; p.connected = true;
-    room.players.push(p); socket.data.room = room.code; socket.data.player = p.id; addLog(room, p.name + '加入房间'); setEvent(room,'join',p.name+'加入房间'); socket.emit('roomJoined',{code:room.code}); emitRoom(room);
+    room.players.push(p); touchRoom(room); socket.data.room = room.code; socket.data.player = p.id; addLog(room, p.name + '加入房间'); setEvent(room,'join',p.name+'加入房间'); socket.emit('roomJoined',{code:room.code}); emitRoom(room);
   });
   socket.on('addBot', () => {
     const u = requireUser(socket); if (!u) return; const room = roomOf(socket); if (!room) return socket.emit('errorMessage','请先进入牌桌。');
@@ -395,13 +430,13 @@ io.on('connection', socket => {
     if (room.players.length >= MAX_PLAYERS) return socket.emit('errorMessage','房间已满，每桌最多6名玩家。');
     const names = ['墨染江南','清风入弦','孤舟听雨','长安故里','云水禅心','牌神阿强'];
     const name = names.find(n => !room.players.some(p => p.name === n)) || ('机器人' + Math.floor(100+Math.random()*900));
-    room.players.push(freshPlayer({ name, isBot:true, chips:1000 })); addLog(room,name+'加入房间（机器人已准备）'); setEvent(room,'join',name+'加入房间'); socket.emit('botAdded',{code:room.code}); emitRoom(room);
+    room.players.push(freshPlayer({ name, isBot:true, chips:1000 })); touchRoom(room); addLog(room,name+'加入房间（机器人已准备）'); setEvent(room,'join',name+'加入房间'); socket.emit('botAdded',{code:room.code}); emitRoom(room);
   });
   socket.on('toggleReady', ({ready}={}) => {
     const u = requireUser(socket); if (!u) return; const room = roomOf(socket); const p = roomPlayer(room,socket); if (!room||!p) return;
     if (room.started && !room.ended) return socket.emit('errorMessage','本局正在进行中，不能修改准备状态。');
     if (room.players.length < 2) return socket.emit('errorMessage','至少需要2名玩家才能开始。');
-    p.ready = typeof ready === 'boolean' ? ready : !p.ready;
+    touchRoom(room); p.ready = typeof ready === 'boolean' ? ready : !p.ready;
     addLog(room,p.name+(p.ready?'已准备':'取消准备')); setEvent(room,'ready',p.name+(p.ready?'已准备':'取消准备'));
     if (room.players.every(x=>x.ready)) {
       if (room.players.length < 2) { emitRoom(room); return; }
@@ -409,7 +444,7 @@ io.on('connection', socket => {
     } else emitRoom(room);
   });
   socket.on('action', ({action,data:payload={}}={}) => {
-    const u = requireUser(socket); if (!u) return; const room = roomOf(socket); const p = roomPlayer(room,socket); if (!room||!p) return;
+    const u = requireUser(socket); if (!u) return; const room = roomOf(socket); const p = roomPlayer(room,socket); if (!room||!p) return; touchRoom(room);
     if (action === 'restart') {
       if (room.started && !room.ended) return socket.emit('errorMessage','本局正在进行中，不能重置牌局。');
       p.ready = false; addLog(room,p.name+'取消准备'); setEvent(room,'ready',p.name+'取消准备'); emitRoom(room); return;
@@ -427,22 +462,28 @@ io.on('connection', socket => {
       clearTurnTimers(room); p.out = true; addLog(room,p.name+'弃牌，退出本场比赛'); setEvent(room,'fold',p.name+'弃牌'); emitRoom(room); checkEnd(room); return;
     }
     if (action === 'bet') {
-      const amount = Math.floor(Number(payload.amount));
-      if (!Number.isSafeInteger(amount) || amount <= 0) return socket.emit('errorMessage','请输入有效的整数下注金额。');
+      const mode = payload.mode === 'raise' ? 'raise' : payload.mode === 'call' ? 'call' : 'legacy';
+      const input = Math.floor(Number(payload.amount));
+      if (mode === 'raise' && (!Number.isSafeInteger(input) || input <= 0)) return socket.emit('errorMessage','加注金额必须是大于0的整数。');
+      if (mode === 'legacy' && (!Number.isSafeInteger(input) || input <= 0)) return socket.emit('errorMessage','请输入有效的整数下注金额。');
+      if (p.chips <= 0) return socket.emit('errorMessage','你的筹码不足，无法继续下注。');
       if (p.chips < room.requiredBet) {
         const all = payIn(room,p,p.chips); room.previousBet = Math.max(room.previousBet,all); room.requiredBet = Math.max(room.requiredBet,all); clearTurnTimers(room);
-        addLog(room,p.name+'筹码不足，已全部投注，请等待比牌结束'); setEvent(room,'allin',p.name+'筹码不足，已全部投注'); emitRoom(room); checkEnd(room); return;
+        addLog(room,p.name+'筹码不足，已全部投注，请等待比牌结束'); setEvent(room,'allin',p.name+'筹码不足，已全部投注',{ playerId:p.id, amount:all }); emitRoom(room); checkEnd(room); return;
       }
-      if (amount < room.requiredBet) return socket.emit('errorMessage','下注不能低于当前最低下注 '+room.requiredBet+'。');
-      if (amount > p.chips) return socket.emit('errorMessage','下注不能超过你当前筹码 '+p.chips+'。');
+      let amount = mode === 'call' ? room.requiredBet : mode === 'raise' ? room.requiredBet + input : input;
+      if (amount < room.requiredBet) return socket.emit('errorMessage','下注不能低于当前跟注金额 '+room.requiredBet+'。');
+      if (mode === 'raise' && amount <= room.requiredBet) return socket.emit('errorMessage','加注后的总额必须高于当前跟注金额。');
+      if (amount > p.chips) return socket.emit('errorMessage','本次应支付 '+amount+'，超过你当前筹码 '+p.chips+'。');
       clearTurnTimers(room); const actual = payIn(room,p,amount); room.previousBet = actual; room.requiredBet = actual;
-      addLog(room,p.name+'投注'+actual+'，剩余筹码'+p.chips+'，当前奖池'+room.pot+(p.allIn?'，已全部投注':'')+'；下一位最低下注'+actual);
-      setEvent(room,p.allIn?'allin':'bet',p.name+'下注'+actual); emitRoom(room); chooseNext(room); return;
+      const actionText = mode === 'call' ? '跟注' : mode === 'raise' ? '加注后投入' : '投注';
+      addLog(room,p.name+actionText+actual+'，剩余筹码'+p.chips+'，当前奖池'+room.pot+(p.allIn?'，已全部投注':'')+'；下一位最低跟注'+actual);
+      setEvent(room,p.allIn?'allin':'bet',p.name+actionText+actual,{ playerId:p.id, amount:actual, mode }); emitRoom(room); chooseNext(room); return;
     }
     if (action === 'compare') {
       const target = room.players.find(x=>x.id===payload.targetId);
       if (!target || target.id===p.id || target.out) return socket.emit('errorMessage','请选择一名仍在场的对手进行比牌。');
-      clearTurnTimers(room); p.reveal = true; target.reveal = true;
+      clearTurnTimers(room); room.lastCompare = [p.id, target.id]; p.reveal = true; target.reveal = true;
       const c = compareRanks(rank(p.cards),rank(target.cards));
       // 与上传的 V28 文件一致：平手时走 else 分支，被选择的对手出局。
       if (c < 0) p.out = true; else target.out = true;
@@ -452,6 +493,7 @@ io.on('connection', socket => {
   });
   socket.on('leaveRoom', () => {
     const room = roomOf(socket); const p = roomPlayer(room,socket); if (!room || !p) { socket.data.room = null; socket.data.player = null; return; }
+    touchRoom(room);
     if (room.started && !room.ended) {
       const wasTurn = room.turn === p.id;
       if (wasTurn) clearTurnTimers(room);
@@ -459,7 +501,7 @@ io.on('connection', socket => {
       addLog(room,p.name+'离开牌桌并弃牌'); setEvent(room,'fold',p.name+'离开牌桌'); emitRoom(room);
       if (wasTurn) checkEnd(room);
       else { const aliveNow = alive(room); if (aliveNow.length <= 1 || aliveNow.filter(x=>!x.allIn&&x.chips>0).length <= 1) finishRound(room); }
-    } else { room.players = room.players.filter(x=>x.id!==p.id); if (!room.players.length) { clearTurnTimers(room); rooms.delete(room.code); } else { addLog(room,p.name+'离开房间'); emitRoom(room); } }
+    } else { room.players = room.players.filter(x=>x.id!==p.id); if (!room.players.length) { clearTurnTimers(room); if (room.inactivityTimer) clearTimeout(room.inactivityTimer); rooms.delete(room.code); } else { addLog(room,p.name+'离开房间'); emitRoom(room); } }
     socket.data.room = null; socket.data.player = null; socket.emit('leftRoom'); io.emit('lobbyRooms',lobby());
   });
   socket.on('logout', () => { socket.data.username = null; });
@@ -474,7 +516,7 @@ io.on('connection', socket => {
 });
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log('ZhaJinHua V31 listening on port ' + PORT);
+  console.log('ZhaJinHua V32 listening on port ' + PORT);
   console.log('Persistent data file: ' + DATA_FILE);
   if (SESSION_SECRET === 'change-this-secret-in-railway-v31') console.warn('WARNING: set SESSION_SECRET in Railway variables for production.');
 });
