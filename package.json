@@ -1,8 +1,8 @@
 {
-  "name": "zhajinhua-v38-online",
-  "version": "38.0.0",
+  "name": "zhajinhua-v39-online",
+  "version": "39.0.0",
   "private": true,
-  "description": "V38 multiplayer Golden Flower with call/raise amounts based on the independent dark-bet baseline, bot/trustee consistency, 235-beats-leopard rule, and chip-conserving settlement",
+  "description": "V39 multiplayer Golden Flower with call/raise amounts based on the independent dark-bet baseline, bot/trustee consistency, 235-beats-leopard rule, and chip-conserving settlement",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

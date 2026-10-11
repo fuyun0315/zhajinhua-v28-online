@@ -12,6 +12,9 @@ const { getActionBase, getBetOptions, validateBetAction } = require('./lib/betti
 const PORT = Number(process.env.PORT || 3000);
 const MAX_PLAYERS = 6;
 const ANTE = 20;
+const MIN_ROOM_ANTE = 1;
+const MAX_ROOM_ANTE = 100000;
+const MAX_RECHARGE = 1000000;
 const ROOM_IDLE_MS = 10 * 60 * 1000;
 const TURN_SECONDS = 20;
 const DATA_FILE = process.env.DATA_FILE || process.env.ACCOUNTS_FILE || path.join(__dirname, 'data', 'game-data.json');
@@ -22,13 +25,16 @@ const SESSION_DAYS = 30;
 function loadData() {
   try {
     const d = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-    if (d.accounts && typeof d.accounts === 'object') return { accounts: d.accounts, peakOnline: Number(d.peakOnline) || 0, totalGames: Number(d.totalGames) || 0 };
+    if (d.accounts && typeof d.accounts === 'object') return { accounts: d.accounts, peakOnline: Number(d.peakOnline) || 0, totalGames: Number(d.totalGames) || 0, rechargeRecords: Array.isArray(d.rechargeRecords) ? d.rechargeRecords : [] };
     // Backward-compatible import of the V29/V30 flat accounts.json format.
     const looksLikeLegacyAccounts = d && typeof d === 'object' && Object.values(d).some(v => v && typeof v === 'object' && v.salt && v.hash);
-    return { accounts: looksLikeLegacyAccounts ? d : {}, peakOnline: Number(d.peakOnline) || 0, totalGames: Number(d.totalGames) || 0 };
-  } catch { return { accounts: {}, peakOnline: 0, totalGames: 0 }; }
+    return { accounts: looksLikeLegacyAccounts ? d : {}, peakOnline: Number(d.peakOnline) || 0, totalGames: Number(d.totalGames) || 0, rechargeRecords: [] };
+  } catch { return { accounts: {}, peakOnline: 0, totalGames: 0, rechargeRecords: [] }; }
 }
 let data = loadData();
+if (!Array.isArray(data.rechargeRecords)) data.rechargeRecords = [];
+// A restart destroys in-memory rooms, so any reserved recharge is safe to return to the account wallet.
+for (const a of Object.values(data.accounts)) { if (a && Number(a.rechargeReserve) > 0) { a.chips = Math.max(0, Number(a.chips) || 0) + Number(a.rechargeReserve); a.rechargeReserve = 0; } }
 function saveData() {
   try {
     fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
@@ -77,12 +83,12 @@ function cookieOptions(req) {
 }
 function profile(username) {
   const a = data.accounts[username];
-  return a ? { username, name: a.name, chips: a.chips, wins: a.wins || 0, games: a.games || 0 } : null;
+  return a ? { username, name: a.name, chips: (Number(a.chips) || 0) + (Number(a.rechargeReserve) || 0), wins: a.wins || 0, games: a.games || 0 } : null;
 }
 const app = express();
 app.set('trust proxy', 1);
 app.use(express.json({ limit: '32kb' }));
-app.get('/health', (_req, res) => res.json({ ok: true, version: 'V38', rooms: rooms.size, online: onlineCount(), peakOnline: data.peakOnline, totalGames: data.totalGames, uptime: Math.floor(process.uptime()) }));
+app.get('/health', (_req, res) => res.json({ ok: true, version: 'V39', rooms: rooms.size, online: onlineCount(), peakOnline: data.peakOnline, totalGames: data.totalGames, uptime: Math.floor(process.uptime()) }));
 app.get('/api/stats', (_req, res) => res.json(stats()));
 app.get('/api/me', (req, res) => {
   const username = userFromToken(parseCookies(req.headers.cookie)[SESSION_COOKIE]);
@@ -107,6 +113,30 @@ app.post('/api/login', (req, res) => {
   if (!a || !verifyPassword(password, a)) return res.status(401).json({ ok: false, message: '用户名或密码错误。' });
   res.cookie(SESSION_COOKIE, tokenFor(username), cookieOptions(req));
   res.json({ ok: true, user: profile(username), stats: stats() });
+});
+app.post('/api/recharge', (req, res) => {
+  const username = userFromToken(parseCookies(req.headers.cookie)[SESSION_COOKIE]);
+  if (!username || !data.accounts[username]) return res.status(401).json({ ok: false, message: '登录状态已失效，请重新登录。' });
+  const raw = req.body?.amount;
+  if (!(typeof raw === 'number' || (typeof raw === 'string' && /^\d+$/.test(raw)))) return res.status(400).json({ ok: false, message: '充值金额必须为正整数。' });
+  const amount = Number(raw);
+  if (!Number.isSafeInteger(amount) || amount < 1 || amount > MAX_RECHARGE) return res.status(400).json({ ok: false, message: `单次充值金额须为1至${MAX_RECHARGE}之间的正整数。` });
+  const requestId = String(req.body?.requestId || '');
+  if (!/^[a-zA-Z0-9_-]{16,80}$/.test(requestId)) return res.status(400).json({ ok: false, message: '充值请求编号无效，请重试。' });
+  const existing = data.rechargeRecords.find(r => r.username === username && r.requestId === requestId);
+  if (existing) return res.json({ ok: true, duplicate: true, message: '该笔充值已处理，不会重复到账。', user: profile(username), record: existing });
+  const a = data.accounts[username];
+  const oldReserve = Number(a.rechargeReserve) || 0;
+  a.rechargeReserve = oldReserve + amount;
+  const record = { id: crypto.randomUUID(), requestId, username, amount, status: 'success', createdAt: new Date().toISOString() };
+  data.rechargeRecords.push(record);
+  if (data.rechargeRecords.length > 10000) data.rechargeRecords = data.rechargeRecords.slice(-10000);
+  if (!saveData()) {
+    a.rechargeReserve = oldReserve;
+    data.rechargeRecords = data.rechargeRecords.filter(r => r.id !== record.id);
+    return res.status(500).json({ ok: false, message: '充值保存失败，积分未到账，请稍后重试。' });
+  }
+  res.json({ ok: true, message: `充值成功！已增加 ${amount} 积分。`, user: profile(username), record });
 });
 app.post('/api/logout', (req, res) => { res.clearCookie(SESSION_COOKIE, { httpOnly: true, sameSite: 'lax', secure: !!(req.secure || req.headers['x-forwarded-proto'] === 'https'), path: '/' }); res.json({ ok: true }); });
 app.use(express.static(path.join(__dirname, 'public')));
@@ -168,14 +198,14 @@ function publicState(room, forId) {
     const canSee = (p.id === forId && p.seen) || compareMaySee || room.ended;
     return { id: p.id, name: p.name, chips: p.chips, out: p.out, reveal: room.ended || compareMaySee, seen: p.seen, bet: p.bet, totalBet: p.totalBet, roundBet: p.roundBet || 0, allIn: p.allIn, connected: p.connected, trustee: p.trustee, isBot: !!p.isBot, ready: !!p.ready, timeLeft: p.timeLeft, cards: canSee ? p.cards : p.cards.map(() => null) };
   });
-  return { code: room.code, players: ps, me: forId, phase: room.phase, round: room.round, turn: room.turn, pot: room.pot, requiredBet: room.requiredBet, darkBetBase: room.darkBetBase || ANTE, previousBet: room.previousBet, lastBetAmount: room.lastBetAmount || ANTE, hasBetAction: !!room.hasBetAction, started: room.started, dealing: room.dealing, ended: room.ended, compareMode: room.compareMode, readyCount: room.players.filter(p => p.ready).length, minPlayers: 2, maxPlayers: MAX_PLAYERS, log: room.log.slice(0, 45), message: room.message, event: room.event, lastSettlement: room.lastSettlement || null, stats: stats() };
+  return { code: room.code, ante: room.ante || ANTE, players: ps, me: forId, phase: room.phase, round: room.round, turn: room.turn, pot: room.pot, requiredBet: room.requiredBet, darkBetBase: room.darkBetBase || ANTE, previousBet: room.previousBet, lastBetAmount: room.lastBetAmount || ANTE, hasBetAction: !!room.hasBetAction, started: room.started, dealing: room.dealing, ended: room.ended, compareMode: room.compareMode, readyCount: room.players.filter(p => p.ready).length, minPlayers: 2, maxPlayers: MAX_PLAYERS, log: room.log.slice(0, 45), message: room.message, event: room.event, lastSettlement: room.lastSettlement || null, stats: stats() };
 }
 function emitRoom(room) {
   for (const p of room.players) if (p.socketId) io.to(p.socketId).emit('state', publicState(room, p.id));
   io.emit('lobbyRooms', lobby());
 }
 function lobby() {
-  return [...rooms.values()].filter(r => r.players.length < MAX_PLAYERS && (!r.started || r.ended)).map(r => ({ code: r.code, players: r.players.length, maxPlayers: MAX_PLAYERS, ready: r.players.filter(p => p.ready).length, host: r.players[0]?.name || '玩家', status: r.started && !r.ended ? '游戏中' : r.ended ? '本局结束' : '等待准备' }));
+  return [...rooms.values()].filter(r => r.players.length < MAX_PLAYERS && (!r.started || r.ended)).map(r => ({ code: r.code, players: r.players.length, maxPlayers: MAX_PLAYERS, ready: r.players.filter(p => p.ready).length, host: r.players[0]?.name || '玩家', status: r.started && !r.ended ? '游戏中' : r.ended ? '本局结束' : '等待准备', ante: r.ante || ANTE }));
 }
 function persistRoomChips(room) {
   for (const p of room.players) if (p.accountId && data.accounts[p.accountId]) data.accounts[p.accountId].chips = p.chips;
@@ -293,7 +323,7 @@ function botAct(room, p) {
 }
 function pruneUnderfundedPlayers(room) {
   if (!room || (room.started && !room.ended)) return [];
-  const poor = room.players.filter(p => !p.leftRoom && p.chips < ANTE);
+  const poor = room.players.filter(p => !p.leftRoom && (p.chips + (p.accountId && data.accounts[p.accountId] ? (Number(data.accounts[p.accountId].rechargeReserve) || 0) : 0)) < (room.ante || ANTE));
   if (!poor.length) return [];
   const poorNames = poor.map(p => p.name);
   for (const p of poor) {
@@ -305,7 +335,7 @@ function pruneUnderfundedPlayers(room) {
     if (socketId) {
       const sock = io.sockets.sockets.get(socketId);
       if (sock) {
-        sock.emit('roomNotice', `你的筹码不足当前牌桌最低底注${ANTE}，已在新一局开始前退出牌桌。补充虚拟筹码后可重新加入。`);
+        sock.emit('roomNotice', `你的筹码不足本房间每局初始投入${room.ante || ANTE}，已在新一局开始前退出牌桌。补充虚拟筹码后可重新加入。`);
         sock.emit('leftRoom');
         sock.data.room = null;
         sock.data.player = null;
@@ -313,7 +343,7 @@ function pruneUnderfundedPlayers(room) {
     }
   }
   room.players = room.players.filter(p => !p.leftRoom);
-  addLog(room, poorNames.join('、') + `筹码不足最低底注${ANTE}，已退出牌桌并释放座位`);
+  addLog(room, poorNames.join('、') + `筹码不足本房间每局初始投入${room.ante || ANTE}，已退出牌桌并释放座位`);
   setEvent(room, 'warning', '筹码不足最低底注的玩家已退出牌桌');
   if (room.players.length === 0) {
     clearTurnTimers(room);
@@ -333,12 +363,13 @@ function startRound(room) {
   clearTurnTimers(room);
   room.round += 1; room.deck = shuffledDeck(); room.pot = 0; room.lastCompare = []; room.lastSettlement = null; room.requiredBet = ANTE; room.darkBetBase = ANTE; room.previousBet = ANTE; room.lastBetAmount = ANTE; room.hasBetAction = false; room.ended = false; room.started = true; room.dealing = true; room.phase = 'playing'; room.compareMode = false; room.log = [];
   for (const p of room.players) {
+    if (p.accountId && data.accounts[p.accountId] && Number(data.accounts[p.accountId].rechargeReserve) > 0) { const a = data.accounts[p.accountId]; p.chips += Number(a.rechargeReserve); a.chips = p.chips; a.rechargeReserve = 0; }
     p.cards = []; p.out = false; p.reveal = false; p.seen = false; p.bet = 0; p.totalBet = 0; p.roundBet = 0; p.allIn = false; p.timeLeft = TURN_SECONDS; p.ready = false;
-    p.chips -= ANTE; p.totalBet = ANTE; p.allIn = p.chips === 0; room.pot += ANTE;
+    const ante = Number(room.ante) || ANTE; p.chips -= ante; p.totalBet = ante; p.roundBet = ante; p.allIn = p.chips === 0; room.pot += ante;
   }
   persistRoomChips(room);
   const order = [...room.players]; const startIndex = Math.floor(Math.random()*order.length); const dealOrder = order.map((_,k)=>order[(startIndex+k)%order.length]);
-  room.turn = null; addLog(room, '第' + room.round + '局开始，每人缴纳20底注，正在发牌'); setEvent(room, 'start', '发牌开始'); emitRoom(room);
+  room.turn = null; addLog(room, '第' + room.round + '局开始，每人缴纳' + (room.ante || ANTE) + '初始投入，正在发牌'); setEvent(room, 'start', '发牌开始'); emitRoom(room);
   const total = dealOrder.length * 3; let pos = 0;
   const one = () => {
     if (!rooms.has(room.code) || !room.started || room.ended) return;
@@ -399,7 +430,7 @@ function finishRound(room) {
     p.reveal = true;
     p.ready = !!p.isBot;
     if (p.accountId && data.accounts[p.accountId]) {
-      const a = data.accounts[p.accountId]; a.chips = p.chips; a.games = (a.games || 0) + 1;
+      const a = data.accounts[p.accountId]; a.chips = p.chips; a.games = (a.games || 0) + 1; if (p.leftRoom && Number(a.rechargeReserve) > 0) { a.chips += Number(a.rechargeReserve); a.rechargeReserve = 0; }
       if ((payouts.get(p.id) || 0) > 0 && !(result.refunds.get(p.id) > 0 && payouts.get(p.id) === result.refunds.get(p.id))) a.wins = (a.wins || 0) + 1;
     }
   }
@@ -474,14 +505,17 @@ io.on('connection', socket => {
   }
   socket.emit('stats', stats()); socket.emit('lobbyRooms', lobby());
   socket.on('lobbyRefresh', () => { socket.emit('lobbyRooms', lobby()); socket.emit('stats', stats()); });
-  socket.on('createRoom', () => {
+  socket.on('createRoom', ({ ante: requestedAnte } = {}) => {
     const u = requireUser(socket); if (!u) return;
     const existing = findPlayerRoom(u);
     if (existing) { const {room, player} = existing; player.socketId = socket.id; player.connected = true; socket.data.room = room.code; socket.data.player = player.id; socket.emit('roomCreated', { code: room.code, resumed: true }); emitRoom(room); return; }
     const a = data.accounts[u];
-    if ((Number(a.chips) || 0) < ANTE) { socket.emit('errorMessage', `你的虚拟筹码不足当前最低底注${ANTE}，暂时不能创建或加入牌桌。`); return; }
+    const roomAnte = requestedAnte === undefined ? ANTE : Number(requestedAnte);
+    if (!Number.isSafeInteger(roomAnte) || roomAnte < MIN_ROOM_ANTE || roomAnte > MAX_ROOM_ANTE) return socket.emit('errorMessage', `每局初始投入必须为${MIN_ROOM_ANTE}至${MAX_ROOM_ANTE}之间的正整数。`);
+    if ((Number(a.chips) || 0) + (Number(a.rechargeReserve) || 0) < roomAnte) { socket.emit('errorMessage', `你的虚拟筹码不足本房间每局初始投入${roomAnte}，暂时不能创建牌桌。`); return; }
+    if ((Number(a.rechargeReserve) || 0) > 0) { a.chips = (Number(a.chips) || 0) + a.rechargeReserve; a.rechargeReserve = 0; saveData(); }
     const p = freshPlayer({ accountId: u, name: a.name, chips: a.chips }); p.socketId = socket.id; p.connected = true;
-    const c = code(); const room = { code:c, players:[p], phase:'ready', round:0, turn:null, pot:0, requiredBet:ANTE, darkBetBase:ANTE, previousBet:ANTE, lastBetAmount:ANTE, hasBetAction:false, started:false, dealing:false, ended:false, compareMode:false, log:[], message:'房间已创建，等待其他玩家加入。所有玩家准备后自动开始。', event:{id:nextEventId++,type:'lobby',text:'房间已创建'}, timer:null, tick:null, deck:[], lastCompare:[], lastSettlement:null, inactivityTimer:null };
+    const c = code(); const room = { code:c, ante:roomAnte, players:[p], phase:'ready', round:0, turn:null, pot:0, requiredBet:ANTE, darkBetBase:ANTE, previousBet:ANTE, lastBetAmount:ANTE, hasBetAction:false, started:false, dealing:false, ended:false, compareMode:false, log:[], message:'房间已创建，等待其他玩家加入。所有玩家准备后自动开始。', event:{id:nextEventId++,type:'lobby',text:'房间已创建'}, timer:null, tick:null, deck:[], lastCompare:[], lastSettlement:null, inactivityTimer:null };
     rooms.set(c, room); touchRoom(room); socket.data.room = c; socket.data.player = p.id; socket.emit('roomCreated', { code:c }); emitRoom(room);
   });
   socket.on('joinRoom', ({code:roomCode}={}) => {
@@ -491,10 +525,10 @@ io.on('connection', socket => {
     const room = rooms.get(String(roomCode||'').trim());
     if (!room) { socket.emit('errorMessage', '房间不存在，请检查6位房间号。'); return; }
     const account = data.accounts[u];
-    if ((Number(account.chips) || 0) < ANTE) { socket.emit('errorMessage', `你的虚拟筹码不足当前最低底注${ANTE}，无法加入该房间。`); return; }
+    if ((Number(account.chips) || 0) + (Number(account.rechargeReserve) || 0) < (room.ante || ANTE)) { socket.emit('errorMessage', `你的虚拟筹码不足该房间每局初始投入${room.ante || ANTE}，无法加入该房间。`); return; }
     if (room.started && !room.ended) { socket.emit('errorMessage', '该房间正在进行牌局，请选择等待中的房间。'); return; }
     if (room.players.length >= MAX_PLAYERS) { socket.emit('errorMessage', '房间已满，每桌最多6名玩家。'); return; }
-    const a = data.accounts[u]; const p = freshPlayer({ accountId:u, name:a.name, chips:a.chips }); p.socketId = socket.id; p.connected = true;
+    const a = data.accounts[u]; if ((Number(a.rechargeReserve) || 0) > 0) { a.chips = (Number(a.chips) || 0) + a.rechargeReserve; a.rechargeReserve = 0; saveData(); } const p = freshPlayer({ accountId:u, name:a.name, chips:a.chips }); p.socketId = socket.id; p.connected = true;
     room.players.push(p); touchRoom(room); socket.data.room = room.code; socket.data.player = p.id; addLog(room, p.name + '加入房间'); setEvent(room,'join',p.name+'加入房间'); socket.emit('roomJoined',{code:room.code}); emitRoom(room);
   });
   socket.on('addBot', () => {
