@@ -3,7 +3,7 @@ const $ = id => document.getElementById(id);
 const socket = io({ autoConnect: false, transports: ['websocket', 'polling'] });
 let loggedIn = false, currentUser = null, roomCode = '', state = null;
 let registerMode = false, quickBotPending = false, compareMode = false, returningToLobby = false;
-let audioCtx = null, lastEventId = 0, toastTimer = null, authBusy = false;
+let audioCtx = null, lastEventId = 0, toastTimer = null, authBusy = false, modalMode = null, modalBusy = false;
 
 function showScreen(name) {
   ['authScreen','lobbyScreen','tableScreen'].forEach(id => $(id).classList.toggle('hidden', id !== name));
@@ -77,12 +77,42 @@ function renderLobbyRooms(rooms) {
   const box = $('roomList'); if (!box) return;
   setText('roomCount', rooms.length + ' 张可加入');
   if (!rooms.length) { box.innerHTML = '<div class="empty-state">暂时没有开放牌桌。<br>点击上方「创建房间」开始，或使用「单人练习」。</div>'; return; }
-  box.innerHTML = rooms.map(r => `<div class="room-card"><div class="room-code">${escapeHtml(r.code)}</div><div class="room-meta">房主：${escapeHtml(r.host || '玩家')}<br>人数：${Number(r.players)||0}/${Number(r.maxPlayers)||6}　·　准备：${Number(r.ready)||0} 人<br>${escapeHtml(r.status || '等待加入')}</div><button data-room="${escapeHtml(r.code)}">加入这张牌桌</button></div>`).join('');
+  box.innerHTML = rooms.map(r => `<div class="room-card"><div class="room-code">${escapeHtml(r.code)}</div><div class="room-meta">房主：${escapeHtml(r.host || '玩家')}<br>人数：${Number(r.players)||0}/${Number(r.maxPlayers)||6}　·　准备：${Number(r.ready)||0} 人<br>每局初始投入：${Number(r.ante)||20}<br>${escapeHtml(r.status || '等待加入')}</div><button data-room="${escapeHtml(r.code)}">加入这张牌桌</button></div>`).join('');
   box.querySelectorAll('button[data-room]').forEach(b => b.addEventListener('click', () => joinRoom(b.dataset.room)));
 }
 function ensureLoggedIn() { if (!loggedIn || !socket.connected) { showScreen('authScreen'); authMessage('登录连接正在恢复，请稍后再操作。', true); return false; } return true; }
-function createRoom() { if (!ensureLoggedIn()) return; quickBotPending = false; lobbyMessage('正在创建房间…'); socket.emit('createRoom'); }
-function createPracticeRoom() { if (!ensureLoggedIn()) return; quickBotPending = true; lobbyMessage('正在创建练习房间…'); socket.emit('createRoom'); }
+function openModal(mode) {
+  modalMode = mode; modalBusy = false; $('modalConfirm').disabled = false; $('modalAmount').disabled = false; $('modalMessage').textContent = '';
+  const isCreate = mode === 'create';
+  setText('modalTitle', isCreate ? '创建房间' : '模拟充值');
+  setText('modalCopy', isCreate ? '设置每位玩家每局开始时投入的虚拟筹码。后续下注规则保持不变。' : '仅增加游戏内虚拟积分，不涉及真实支付。单次充值上限为1,000,000积分。');
+  setText('modalLabel', isCreate ? '本局底牌投入金额' : '充值积分金额');
+  $('modalAmount').max = isCreate ? '100000' : '1000000'; $('modalAmount').min = '1'; $('modalAmount').step = '1'; $('modalAmount').value = isCreate ? '20' : '1000';
+  $('modalBackdrop').classList.remove('hidden'); setTimeout(() => $('modalAmount').focus(), 30);
+}
+function closeModal() { if (modalBusy) return; $('modalBackdrop').classList.add('hidden'); modalMode = null; }
+function createRoom() { if (!ensureLoggedIn()) return; quickBotPending = false; openModal('create'); }
+function createPracticeRoom() { if (!ensureLoggedIn()) return; quickBotPending = true; lobbyMessage('正在创建练习房间…'); socket.emit('createRoom', { ante: 20 }); }
+async function confirmModal() {
+  if (modalBusy || !modalMode) return;
+  const raw = $('modalAmount').value;
+  if (!/^\d+$/.test(raw)) { setText('modalMessage', '请输入有效的正整数。'); return; }
+  const amount = Number(raw), max = modalMode === 'create' ? 100000 : 1000000;
+  if (!Number.isSafeInteger(amount) || amount < 1 || amount > max) { setText('modalMessage', `金额必须为1至${max}之间的正整数。`); return; }
+  if (modalMode === 'create') { modalBusy = true; $('modalConfirm').disabled = true; $('modalBackdrop').classList.add('hidden'); quickBotPending = false; lobbyMessage('正在创建房间…'); socket.emit('createRoom', { ante: amount }); modalMode = null; modalBusy = false; $('modalConfirm').disabled = false; return; }
+  modalBusy = true; $('modalConfirm').disabled = true; $('modalAmount').disabled = true; setText('modalMessage', '正在处理充值…');
+  try {
+    const requestId = (crypto.randomUUID ? crypto.randomUUID() : ('req_' + Date.now() + '_' + Math.random().toString(36).slice(2)));
+    const r = await api('/api/recharge', { amount, requestId });
+    if (r.user) { currentUser = { ...currentUser, ...r.user }; setText('welcomeBalance', '账户积分：' + (Number(r.user.chips) || 0)); }
+    setText('modalMessage', r.message || `充值成功！已增加 ${amount} 积分。`); toast(r.message || `充值成功！已增加 ${amount} 积分。`);
+    setTimeout(() => { modalBusy = false; $('modalBackdrop').classList.add('hidden'); $('modalAmount').disabled = false; $('modalConfirm').disabled = false; modalMode = null; }, 900);
+  } catch (e) { setText('modalMessage', e.message || '充值失败，请重试。'); modalBusy = false; $('modalAmount').disabled = false; $('modalConfirm').disabled = false; }
+}
+$('modalConfirm').addEventListener('click', confirmModal); $('modalCancel').addEventListener('click', closeModal);
+$('modalBackdrop').addEventListener('click', e => { if (e.target === $('modalBackdrop')) closeModal(); });
+$('modalAmount').addEventListener('keydown', e => { if (e.key === 'Enter') confirmModal(); if (e.key === 'Escape') closeModal(); });
+$('rechargeBtn').addEventListener('click', () => openModal('recharge')); $('rechargeBtnTable').addEventListener('click', () => openModal('recharge'));
 function joinRoom(code) {
   if (!ensureLoggedIn()) return;
   code = String(code || '').trim(); if (!/^\d{6}$/.test(code)) return lobbyMessage('请输入完整的6位数字房间号。', true);
@@ -110,7 +140,7 @@ socket.on('errorMessage', msg => { if ($('tableScreen').classList.contains('hidd
 socket.on('roomNotice', msg => toast(msg));
 socket.on('roomExpired', msg => toast(msg));
 socket.on('botAdded', () => { tableMessage('机器人已加入牌桌并自动准备。'); socket.emit('lobbyRefresh'); });
-socket.on('leftRoom', () => { returningToLobby = false; state = null; compareMode = false; showScreen('lobbyScreen'); socket.emit('lobbyRefresh'); });
+socket.on('leftRoom', async () => { returningToLobby = false; state = null; compareMode = false; showScreen('lobbyScreen'); socket.emit('lobbyRefresh'); try { const r = await api('/api/me'); if (r.authenticated && r.user) { currentUser = r.user; setText('welcomeBalance', '账户积分：' + (Number(currentUser.chips)||0)); } } catch {} });
 $('backLobbyBtn').addEventListener('click', () => {
   returningToLobby = true; socket.emit('leaveRoom'); roomCode = ''; state = null; compareMode = false; showScreen('lobbyScreen'); lobbyMessage('正在返回大厅…');
 });
@@ -190,9 +220,9 @@ function render(s) {
   const players = s.players || [], me = players.find(p => p.id === s.me); if (!me) return;
   const current = players.find(p => p.id === s.turn);
   const readyCount = Number(s.readyCount) || players.filter(p=>p.ready).length;
-  setText('tableSubtitle', s.started ? `第 ${s.round} 局 · ${current ? '轮到 '+current.name : '等待操作'}` : s.ended ? '本局已结束 · 等待所有玩家准备下一局' : `等待开始 · 已准备 ${readyCount}/${players.length} 人`);
+  setText('tableSubtitle', (s.started ? `第 ${s.round} 局 · ${current ? '轮到 '+current.name : '等待操作'}` : s.ended ? '本局已结束 · 等待所有玩家准备下一局' : `等待开始 · 已准备 ${readyCount}/${players.length} 人`) + ` · 每局初始投入 ${Number(s.ante)||20}`);
   setText('pot', '底池：' + (Number(s.pot) || 0));
-  if (currentUser) { currentUser.chips = Number(me.chips) || 0; setText('welcomeBalance', '可用筹码：' + currentUser.chips); }
+
   if (s.started && s.dealing) setText('deal', '正在发牌，请稍候…');
   else if (s.started) setText('deal', s.turn === s.me ? (me.trustee ? '托管中：自动跟注' : '轮到你操作') : (current ? '等待 ' + current.name + ' 操作' : '等待对手操作'));
   else if (s.ended) setText('deal', s.message || '本局结束，点击准备下一局');
@@ -212,7 +242,7 @@ function render(s) {
     else if (p.allIn) playerStatus = '已全押';
     else if (p.id === s.turn) playerStatus = '剩余 '+(Number(p.timeLeft) || 0)+' 秒';
     else playerStatus = p.trustee ? '托管中' : (p.connected ? '在线' : '断线');
-    el.innerHTML = `<div class="name">${escapeHtml(p.name)}${isMe?'（你）':''}${p.isBot?' · 机器人':''}</div><div class="chips">筹码 ${Number(p.chips)||0}</div><div class="timer">${escapeHtml(playerStatus)}</div><div class="cards">${cards.map(c=>`<div class="card ${!c?'back':((c.s==='♥'||c.s==='♦')?'red':'black')} ">${!c?'★':escapeHtml(cardText(c))}</div>`).join('')}</div>`;
+    el.innerHTML = `<div class="name">${escapeHtml(p.name)}${isMe?'（你）':''}${p.isBot?' · 机器人':''}</div>${p.seen?'<div class="seen-badge">已看牌</div>':''}<div class="chips">筹码 ${Number(p.chips)||0}</div><div class="contribution">本局已投入：${Number(p.totalBet)||0}</div><div class="timer">${escapeHtml(playerStatus)}</div><div class="cards">${cards.map(c=>`<div class="card ${!c?'back':((c.s==='♥'||c.s==='♦')?'red':'black')} ">${!c?'★':escapeHtml(cardText(c))}</div>`).join('')}</div>`;
     if (!isMe && compareMode && s.started && !s.ended && !p.out && s.turn === s.me) { el.classList.add('compare-target'); el.addEventListener('click', () => { compareMode=false; emitAction('compare',{targetId:p.id}); }); }
     box.appendChild(el);
   });
